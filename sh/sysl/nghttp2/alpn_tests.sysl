@@ -1,0 +1,59 @@
+module sh.sysl.nghttp2
+@tests
+
+// The ALPN seam, checked without a TLS library in the room.
+
+import sysl.buf.Buf
+
+@test("a list offering h2 is recognised, wherever h2 sits in it")
+h2_is_found_in_a_list()
+    assert(offers_h2(alpn_list(["h2"]).unwrap().view()))
+    assert(offers_h2(alpn_list(["h2", "http/1.1"]).unwrap().view()))
+    assert(offers_h2(alpn_list(["http/1.1", "h2"]).unwrap().view()))
+end h2_is_found_in_a_list
+
+@test("a list with no h2 in it is not h2, and neither is an empty one")
+h2_is_not_found_where_it_is_not()
+    assert(!offers_h2(alpn_list(["http/1.1"]).unwrap().view()))
+    assert(!offers_h2(alpn_list(["http/1.1", "h3"]).unwrap().view()))
+
+    val nothing: []u8 = []
+
+    assert(!offers_h2(nothing))
+end h2_is_not_found_where_it_is_not
+
+// **`h2c` is not `h2` and this says so.** `h2c` is HTTP/2 without TLS, and it is never an ALPN
+// name -- there is no TLS handshake to carry it. A list naming it is a list from something that has
+// misunderstood the protocol, and answering `true` would hand a cleartext session to a TLS server.
+@test("h2c is not h2, because h2c never travels over ALPN at all")
+h2c_is_not_h2()
+    assert(!offers_h2(alpn_list(["h2c"]).unwrap().view()))
+
+// The wire form is a length byte before each name, which is what a TLS library wants and what
+// nothing about a list of strings suggests.
+@test("the wire form is a length byte before each name")
+the_list_is_length_prefixed()
+    val list = alpn_list(["h2", "http/1.1"]).unwrap()
+
+    assert_eq(list.len(), 12)
+
+    val want: []u8 = [2, 104, 50, 8, 104, 116, 116, 112, 47, 49, 46, 49]
+
+    assert(list.view() == want)
+end the_list_is_length_prefixed
+
+@test("a name ALPN cannot carry is refused rather than truncated")
+an_uncarryable_name_is_refused()
+    alpn_list([""]) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code < 0)
+
+    var long = ""
+
+    for i in 0..<256
+        long += "x"
+
+    alpn_list([long]) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code < 0)
+end an_uncarryable_name_is_refused

@@ -46,3 +46,30 @@ private[nghttp2] failing(code: i32, what: string) -> Error = Error(code, s"${wha
  */
 error_name(code: u32) -> string =
     from_cstring(c.http2_strerror(code)).unwrap_or(s"HTTP/2 error ${code}")
+
+// ## The codes that travel on the wire
+//
+// **These are HTTP/2's, not the library's**, and they are what a RST_STREAM or a GOAWAY carries.
+// They are named here rather than left in the C module for the reason the org's two-layer rule
+// gives: a program spells `CANCEL` when it gives up on a stream, and it should not have to import a
+// module whose own first paragraph says nothing in it is meant to be called.
+//
+// **`const` rather than `val`, and that is not a style choice.** A module-level `val` is storage an
+// initializer fills before a program's statements run, and a `build-c` archive for a freestanding
+// target has no entry point to run one -- so a package that used `val` here could not be built for
+// a board. Each of these folds to a literal instead.
+
+const NO_ERROR: u32            = c.NO_ERROR
+const PROTOCOL_ERROR: u32      = c.PROTOCOL_ERROR
+const INTERNAL_ERROR: u32      = c.INTERNAL_ERROR
+const FLOW_CONTROL_ERROR: u32  = c.FLOW_CONTROL_ERROR
+const SETTINGS_TIMEOUT: u32    = c.SETTINGS_TIMEOUT
+const STREAM_CLOSED: u32       = c.STREAM_CLOSED
+const FRAME_SIZE_ERROR: u32    = c.FRAME_SIZE_ERROR
+const REFUSED_STREAM: u32      = c.REFUSED_STREAM
+const CANCEL: u32              = c.CANCEL
+const COMPRESSION_ERROR: u32   = c.COMPRESSION_ERROR
+const CONNECT_ERROR: u32       = c.CONNECT_ERROR
+const ENHANCE_YOUR_CALM: u32   = c.ENHANCE_YOUR_CALM
+const INADEQUATE_SECURITY: u32 = c.INADEQUATE_SECURITY
+const HTTP_1_1_REQUIRED: u32   = c.HTTP_1_1_REQUIRED

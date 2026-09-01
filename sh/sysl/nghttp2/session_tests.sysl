@@ -1,0 +1,429 @@
+module sh.sysl.nghttp2
+@tests
+
+// The whole protocol, driven between two sessions in memory.
+//
+// **There is no socket anywhere in this file, and that is the point rather than a convenience.**
+// A session is a byte-stream transformer, so a client and a server can be wired to each other by
+// handing each one what the other wrote. What that buys is a test of the *protocol* -- a real
+// preface, real HPACK, real flow control, real GOAWAY -- with nothing that can hang, nothing that
+// needs a port, and no order of events that depends on the kernel.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// Both ends of a connection, and the wire between them.
+private struct Pair
+    client: &Session
+    server: &Session
+
+    /** Everything each end wants to write, handed to the other, until neither has anything left.
+     *
+     * **A loop rather than one pass**, because a frame often provokes a frame: SETTINGS is
+     * acknowledged, a request is answered, a body extends a window. Two passes would leave the last
+     * of those in the outgoing buffer and the test would assert against a half-finished exchange.
+     */
+    flush(*self)
+        loop
+            var to_server: Buf[u8] = buf()
+            var to_client: Buf[u8] = buf()
+
+            self.client.send(&to_server).unwrap()
+            self.server.send(&to_client).unwrap()
+
+            if to_server.len() == 0 && to_client.len() == 0 then break
+
+            if to_server.len() > 0 then self.server.receive(to_server.view()).unwrap()
+            if to_client.len() > 0 then self.client.receive(to_client.view()).unwrap()
+    end flush
+end Pair
+
+private pair() -> Pair = Pair(client().unwrap(), server().unwrap())
+
+// Every event an end has queued, as one line each -- so an assertion says what the whole exchange
+// looked like rather than which field of which event disagreed.
+private drain(s: &Session) -> string
+    var out = ""
+
+    loop
+        s.next_event() match
+            Some(e) ->
+                if out.len > 0 then out += "|"
+
+                out += describe(e)
+            None -> break
+
+    out
+end drain
+
+private describe(e: Event) -> string = e match
+    Headers(id, hs, k) -> s"headers ${id} ${kind_name(k)} ${fields(hs)}"
+    Data(id, bs) -> s"data ${id} ${from_utf8_unchecked(bs.view())}"
+    StreamEnd(id) -> s"end ${id}"
+    StreamClose(id, code) -> s"close ${id} ${error_name(code)}"
+    Settings -> "settings"
+    Goaway(last, code) -> s"goaway ${last} ${error_name(code)}"
+    RstStream(id, code) -> s"reset ${id} ${error_name(code)}"
+    WindowUpdate(id, n) -> s"window ${id} ${n}"
+    Ping(ack) -> if ack then "ping ack" else "ping"
+
+private kind_name(k: HeaderKind) -> string = k match
+    Request -> "request"
+    Response -> "response"
+    PushResponse -> "push"
+    Trailer -> "trailer"
+
+private fields(hs: Buf[Header]) -> string
+    var out = ""
+
+    for i in 0..<hs.len()
+        if i > 0 then out += ","
+
+        val h = hs.at(i)
+
+        out += s"${h.name}=${h.value}"
+
+    out
+end fields
+
+private get(path: string) -> []Header = [header(":method", "GET"), header(":scheme", "https"),
+    header(":path", path), header(":authority", "example.test")]
+
+private ok(kind: string) -> []Header = [header(":status", "200"), header("content-type", kind)]
+
+// -- the preface -------------------------------------------------------------------------------
+
+// **The first twenty-four bytes a client writes are the connection preface**, and nghttp2 writes
+// them itself rather than the caller submitting anything. Asserting the exact text is what says
+// this is HTTP/2 on the wire rather than something that merely round-trips with itself.
+@test("a client's first bytes are RFC 9113's connection preface")
+the_client_opens_with_the_preface()
+    var cl = client().unwrap()
+
+    var out: Buf[u8] = buf()
+
+    cl.send(&out).unwrap()
+
+    assert(out.len() > 24)
+    assert_eq(from_utf8_unchecked(out.view()[0..<24]), "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+end the_client_opens_with_the_preface
+
+@test("a session knows which end it is")
+each_end_knows_itself()
+    var p = pair()
+
+    assert(!p.client.is_server())
+    assert(p.server.is_server())
+end each_end_knows_itself
+
+// **Both ends hear the other's SETTINGS, and neither hears the acknowledgement of its own.** The
+// ACK bit and the END_STREAM bit are the same bit read against different frames, so a session that
+// reported both would tell a caller twice that the connection had opened.
+@test("opening a connection is one SETTINGS event at each end")
+the_handshake_is_one_settings_each()
+    var p = pair()
+
+    p.flush()
+
+    assert_eq(drain(p.client), "settings")
+    assert_eq(drain(p.server), "settings")
+end the_handshake_is_one_settings_each
+
+// -- a request and a response ------------------------------------------------------------------
+
+@test("a GET arrives at the server as a request, with the stream ended")
+a_get_crosses_the_wire()
+    var p = pair()
+
+    val id = p.client.request(get("/things")).unwrap()
+
+    assert_eq(id, 1)
+
+    p.flush()
+
+    assert_eq(drain(p.server),
+        "settings|headers 1 request :method=GET,:scheme=https,:path=/things," +
+        ":authority=example.test|end 1")
+end a_get_crosses_the_wire
+
+@test("a response with a body arrives as headers, then data, then the end of the stream")
+a_response_with_a_body_crosses_back()
+    var p = pair()
+
+    p.client.request(get("/hello")).unwrap()
+    p.flush()
+
+    drain(p.server)
+
+    p.server.respond(1, ok("text/plain"), Some("hello, world".bytes)).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client),
+        "settings|headers 1 response :status=200,content-type=text/plain|" +
+        "data 1 hello, world|end 1|close 1 NO_ERROR")
+end a_response_with_a_body_crosses_back
+
+// **A stream is closed at both ends before either one hears about it.** `end` says the peer will
+// send no more; `close` says the stream is finished and its identifier will never be used again --
+// which is what a caller keying a table on the stream id has to wait for before deleting the row.
+@test("the server hears the stream close too, once it has answered")
+both_ends_hear_the_close()
+    var p = pair()
+
+    p.client.request(get("/x")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, ok("text/plain"), Some("ok".bytes)).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "close 1 NO_ERROR")
+end both_ends_hear_the_close
+
+@test("a request may carry a body, which is what a POST is")
+a_request_may_carry_a_body()
+    var p = pair()
+
+    val body = "{\"name\":\"thing\"}"
+
+    p.client.request([header(":method", "POST"), header(":scheme", "https"),
+        header(":path", "/things"), header(":authority", "example.test"),
+        header("content-type", "application/json")], Some(body.bytes)).unwrap()
+
+    p.flush()
+
+    assert_eq(drain(p.server),
+        "settings|headers 1 request :method=POST,:scheme=https,:path=/things," +
+        ":authority=example.test,content-type=application/json|" +
+        "data 1 {\"name\":\"thing\"}|end 1")
+end a_request_may_carry_a_body
+
+// **Two requests on one connection is the whole reason for HTTP/2**, and the odd stream numbering
+// is the protocol's: a client opens 1, 3, 5, and a server's own streams would be even.
+//
+// **The order the events come back in is worth reading rather than skimming.** Both header blocks
+// arrive before either body, because HEADERS is not flow-controlled and DATA is -- so nghttp2 sends
+// what it can and then spends window on the payloads. That is interleaving, and it is the thing
+// HTTP/1.1 cannot do at all: on one connection, two responses in flight at once.
+@test("several streams run on one connection at once")
+streams_are_multiplexed()
+    var p = pair()
+
+    val a = p.client.request(get("/a")).unwrap()
+    val b = p.client.request(get("/b")).unwrap()
+    val cc = p.client.request(get("/c")).unwrap()
+
+    assert_eq(a, 1)
+    assert_eq(b, 3)
+    assert_eq(cc, 5)
+
+    p.flush()
+    drain(p.server)
+
+    // Answered out of order, which is a thing HTTP/1.1 cannot do at all.
+    p.server.respond(cc, ok("text/c"), Some("c".bytes)).unwrap()
+    p.server.respond(a, ok("text/a"), Some("a".bytes)).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client),
+        "settings|headers 5 response :status=200,content-type=text/c|" +
+        "headers 1 response :status=200,content-type=text/a|" +
+        "data 1 a|end 1|close 1 NO_ERROR|data 5 c|end 5|close 5 NO_ERROR")
+end streams_are_multiplexed
+
+// **Trailers are a second header block after the body**, which is how a response says something it
+// could not know when it wrote its status line.
+@test("trailers arrive as a header block of their own after the body")
+trailers_follow_a_body()
+    var p = pair()
+
+    p.client.request(get("/stream")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, [header(":status", "200"), header("trailer", "x-count")],
+        Some("rows".bytes), Some([header("x-count", "4")])).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client),
+        "settings|headers 1 response :status=200,trailer=x-count|data 1 rows|" +
+        "headers 1 trailer x-count=4|end 1|close 1 NO_ERROR")
+end trailers_follow_a_body
+
+// -- giving up ---------------------------------------------------------------------------------
+
+@test("a reset stream reaches the peer with the code that was chosen")
+a_stream_may_be_reset()
+    var p = pair()
+
+    p.client.request(get("/slow")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.client.reset(1, CANCEL).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "reset 1 CANCEL|close 1 CANCEL")
+end a_stream_may_be_reset
+
+// **A GOAWAY is a promise rather than a hangup**: streams up to the one it names are still served,
+// and it is the ones above that a client must retry elsewhere. That is what makes a graceful
+// restart possible at all.
+@test("a GOAWAY names the last stream that will be served")
+a_goaway_names_a_last_stream()
+    var p = pair()
+
+    p.client.request(get("/a")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.goaway(p.server.last_stream()).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "settings|goaway 1 NO_ERROR")
+end a_goaway_names_a_last_stream
+
+@test("terminating a session sends a GOAWAY carrying the reason")
+terminate_says_why()
+    var p = pair()
+
+    p.flush()
+    drain(p.client)
+    drain(p.server)
+
+    p.server.terminate(ENHANCE_YOUR_CALM).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "goaway 0 ENHANCE_YOUR_CALM")
+end terminate_says_why
+
+// -- settings and flow control -------------------------------------------------------------------
+
+// **A setting is asked of the peer's session rather than remembered here**, so this asserts that
+// what was submitted at one end is what the other end is working to.
+@test("a setting sent at one end is what the other end reports")
+settings_reach_the_peer()
+    var p = pair()
+
+    p.server.settings([MaxConcurrentStreams(17), InitialWindowSize(1024)]).unwrap()
+    p.flush()
+
+    assert_eq(p.client.peer_setting(MaxConcurrentStreams(0)), 17)
+    assert_eq(p.client.peer_setting(InitialWindowSize(0)), 1024)
+
+    // A parameter neither end named is HTTP/2's default, not zero.
+    assert_eq(p.client.peer_setting(MaxFrameSize(0)), 16384)
+end settings_reach_the_peer
+
+// **Sending a body spends flow-control credit**, and this is the assertion that says so: 65535 is
+// the connection window both ends start with, and twelve bytes of body leave 65523.
+@test("a body spends connection flow-control credit")
+a_body_spends_the_window()
+    var p = pair()
+
+    p.flush()
+
+    assert_eq(p.server.remote_window(), 65535)
+
+    p.client.request(get("/x")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, ok("text/plain"), Some("hello, world".bytes)).unwrap()
+    p.flush()
+
+    assert_eq(p.server.remote_window(), 65535 - 12)
+end a_body_spends_the_window
+
+// **And credit comes back as a WINDOW_UPDATE, which is a frame rather than a bookkeeping entry.**
+// A default session extends its own windows once enough has been consumed; the threshold is half
+// the window, so this sends 40 kilobytes to cross it.
+@test("credit is returned as a WINDOW_UPDATE the peer hears about")
+a_window_update_returns_credit()
+    var p = pair()
+
+    p.client.request(get("/big")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    var big: Buf[u8] = buf()
+
+    for i in 0..<40000
+        big.push(u8(65))
+
+    p.server.respond(1, ok("application/octet-stream"), Some(big.view())).unwrap()
+    p.flush()
+
+    // The server got its credit back, so it may send another 40 kilobytes.
+    assert(p.server.remote_window() > 40000)
+
+    // And it heard about it as an event, on the connection window rather than on a stream.
+    var saw = false
+
+    loop
+        p.server.next_event() match
+            Some(e) -> e match
+                WindowUpdate(id, n) ->
+                    if id == 0 && n > 0 then saw = true
+                _ -> ()
+            None -> break
+
+    assert(saw)
+end a_window_update_returns_credit
+
+@test("a ping comes back as an acknowledgement")
+a_ping_is_answered()
+    var p = pair()
+
+    p.flush()
+    drain(p.client)
+    drain(p.server)
+
+    p.client.ping().unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "ping")
+    assert_eq(drain(p.client), "ping ack")
+end a_ping_is_answered
+
+// -- what a session refuses ----------------------------------------------------------------------
+
+// **A server may not open a stream with a request**, and the refusal is nghttp2's rather than a
+// check written here. Worth pinning because the two constructors differ in nothing a caller can see
+// until one of them says no.
+@test("a server cannot send a request")
+a_server_may_not_request()
+    var sv = server().unwrap()
+
+    sv.request(get("/nope")) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code < 0)
+end a_server_may_not_request
+
+// **Stream 0 is the connection itself and carries no messages**, which nghttp2 refuses outright.
+// A response on a stream that merely does not exist is *not* refused here -- nghttp2 queues it and
+// discards it when it finds no stream, which is deliberate on its part: a stream may have been
+// reset between a request arriving and an answer being written, and that is an ordinary race rather
+// than a fault in the program.
+@test("responding on stream zero is refused")
+a_response_needs_a_real_stream()
+    var sv = server().unwrap()
+
+    sv.respond(0, ok("text/plain")) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code < 0)
+end a_response_needs_a_real_stream
+
+// **Bytes that are not HTTP/2 are refused rather than misread.** A session handed an HTTP/1.1
+// request -- which is what a client that never heard of h2 sends -- fails, and the failure is
+// fatal to the session.
+@test("a session fed HTTP/1.1 refuses it, fatally")
+http_one_is_not_http_two()
+    var sv = server().unwrap()
+
+    sv.receive("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".bytes) match
+        Ok(_) -> assert(false)
+        Err(e) ->
+            assert(e.code < 0)
+            assert(e.fatal())
+end http_one_is_not_http_two

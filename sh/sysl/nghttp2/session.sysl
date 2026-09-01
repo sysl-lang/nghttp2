@@ -1,0 +1,594 @@
+// An HTTP/2 connection, as a byte-stream transformer.
+//
+// **nghttp2 is never given the socket.** Bytes that arrived go in at `receive`, bytes to write come
+// out of `send`, and what happened in between is read off as `Event`s. HTTP/2 is then a
+// *transformation*, and the question of how bytes reach the wire stays entirely the caller's.
+//
+// **That is the same arrangement `sh.sysl.openssl` binds TLS in, which is why the two compose.**
+// A `h2` connection is this session's bytes passed through a TLS `Stream` and back; neither package
+// knows the other exists, and neither owns a file descriptor. It is also what makes the whole
+// protocol drivable between two sessions in memory, with no socket at all -- which is what this
+// package's own tests do.
+//
+// The loop a caller writes is three steps, **and the order is not free**:
+//
+//   1. Ask for progress -- `request`, `respond`, `settings`, or nothing at all.
+//   2. Drain `send` and write every byte of it to the peer.
+//   3. Feed what arrives to `receive`, then drain `next_event` until it answers `None`.
+//
+// **Draining before the first ask writes nothing and both ends then wait forever.** Nothing is
+// queued until something has been asked to produce it -- which is the failure mode `sh.sysl.openssl`
+// records too, and it looks like a network fault rather than a loop written in the wrong order.
+//
+// **A client writes the connection preface itself.** nghttp2 puts the twenty-four bytes of
+// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` at the head of the first thing a client session sends, so
+// nothing here submits it and a caller never sees it go by.
+
+module sh.sysl.nghttp2
+
+import sh.sysl.nghttp2.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.{as_ptr, copy}
+import sysl.text.from_utf8_unchecked
+
+/** What a HEADERS frame was: the head of a request, the head of a response, or trailers.
+ *
+ * **Trailers are a second header block on a stream that already carried one**, which is how a
+ * response reports something it could not know until the body was written -- a checksum, a row
+ * count, a failure halfway through a stream that had already promised a 200.
+ */
+enum HeaderKind
+    Request
+    Response
+    PushResponse
+    Trailer
+end HeaderKind
+
+/** Something the peer did, in the order it happened.
+ *
+ * **An event queue rather than a table of callbacks**, and that is the design decision this file
+ * turns on. nghttp2 calls back from inside `receive`, which is a place a caller's own code has no
+ * business running: it cannot submit frames there without reentering the library, it cannot fail
+ * usefully, and a closure it registered would have to be kept alive by the session. Recording what
+ * happened and handing it over afterwards costs one copy of each header block and gives a caller
+ * ordinary sysl control flow.
+ */
+enum Event
+    /** A complete header block: a request at a server, a response at a client, or trailers. */
+    Headers(stream: i32, headers: Buf[Header], kind: HeaderKind)
+
+    /** A piece of a body. **One event per DATA frame, not one per stream** -- a body arrives in as
+     * many chunks as the peer chose to send, and joining them is the caller's business.
+     */
+    Data(stream: i32, bytes: Buf[u8])
+
+    /** The peer will send no more on this stream. It may still be reading. */
+    StreamEnd(stream: i32)
+
+    /** The stream is finished at both ends, under this code. `NO_ERROR` is the ordinary case. */
+    StreamClose(stream: i32, code: u32)
+
+    /** The peer's SETTINGS arrived and are in force. nghttp2 acknowledges them itself. */
+    Settings
+
+    /** The peer is going away: the last stream it will process, and why. */
+    Goaway(last_stream: i32, code: u32)
+
+    /** The peer gave up on one stream. */
+    RstStream(stream: i32, code: u32)
+
+    /** Flow-control credit. `stream` is 0 for the connection window. */
+    WindowUpdate(stream: i32, increment: i32)
+
+    /** A PING, and whether it was the answer to one of ours. */
+    Ping(ack: bool)
+end Event
+
+/** One SETTINGS parameter.
+ *
+ * An enum rather than an identifier and a number, because the identifiers are a closed set and the
+ * pairing is what a caller gets wrong: `InitialWindowSize(65535)` cannot be written where
+ * `MaxFrameSize` was meant.
+ */
+enum Setting
+    HeaderTableSize(value: u32)
+    EnablePush(value: u32)
+    MaxConcurrentStreams(value: u32)
+    InitialWindowSize(value: u32)
+    MaxFrameSize(value: u32)
+    MaxHeaderListSize(value: u32)
+end Setting
+
+private entry(s: Setting) -> c.SettingsEntry = s match
+    HeaderTableSize(v) -> c.SettingsEntry(c.SETTINGS_HEADER_TABLE_SIZE, v)
+    EnablePush(v) -> c.SettingsEntry(c.SETTINGS_ENABLE_PUSH, v)
+    MaxConcurrentStreams(v) -> c.SettingsEntry(c.SETTINGS_MAX_CONCURRENT_STREAMS, v)
+    InitialWindowSize(v) -> c.SettingsEntry(c.SETTINGS_INITIAL_WINDOW_SIZE, v)
+    MaxFrameSize(v) -> c.SettingsEntry(c.SETTINGS_MAX_FRAME_SIZE, v)
+    MaxHeaderListSize(v) -> c.SettingsEntry(c.SETTINGS_MAX_HEADER_LIST_SIZE, v)
+
+// A body waiting to go out, and how much of it nghttp2 has taken.
+//
+// **The bytes are copied in rather than borrowed**, because a DATA frame is written when flow
+// control allows rather than when it was submitted -- which may be several `send` calls later, and
+// the caller's slice is long gone by then.
+//
+// **The trailers ride here too, and that is forced by the protocol rather than chosen.** A trailer
+// block may only be submitted once the body has ended *without* ending the stream, and the only
+// place that moment exists is inside the read callback -- which is exactly where nghttp2's own
+// documentation says to call `nghttp2_submit_trailer`. So a caller names its trailers when it names
+// its body, and this carries them the few microseconds until they can be sent.
+private struct Body
+    stream: i32
+    bytes: Buf[u8]
+    sent: usize
+    trailers: Buf[Header]
+    has_trailers: bool
+end Body
+
+/** One HTTP/2 connection.
+ *
+ * **A `&Session` for two reasons and either would be enough.** nghttp2 allocated the session and is
+ * owed exactly one `nghttp2_session_del`, which only runs for a value something owns through a box;
+ * and every callback below is handed this struct's own address as nghttp2's user data, so it must
+ * stay where it was put.
+ */
+struct Session
+    private s: *c.Session
+
+    // What the callbacks recorded, and how far the caller has read. **A cursor rather than a
+    // `remove(0)`**, so draining a hundred events is a hundred steps rather than ten thousand; the
+    // storage is released when the queue empties.
+    private events: Buf[Event]
+    private head: usize
+
+    // The header fields of the block currently arriving. nghttp2 reports them one at a time and
+    // then reports the frame, so this is what holds them in between.
+    private pending: Buf[Header]
+
+    private bodies: Buf[Body]
+
+    /** Whether this end is the server. */
+    is_server(self) -> bool = c.session_check_server_session(self.s) != 0
+
+    // -- bytes ---------------------------------------------------------------------------------
+
+    /** Bytes that arrived from the peer, handed to the session.
+     *
+     * Answers how many were consumed, which is all of them unless the session has failed. Every
+     * callback nghttp2 makes happens inside this call, so the events it produced are queued by the
+     * time it returns.
+     */
+    receive(*self, bytes: []const u8) -> Result[usize, Error]
+        val n = c.session_mem_recv2(self.s, as_ptr(bytes), bytes.len)
+
+        if n < 0 then Err(failing(i32(n), "reading what the peer sent")) else Ok(usize(n))
+
+    /** Everything the session wants to write, appended to `out`. Answers how many bytes that was.
+     *
+     * **Drained to exhaustion rather than one frame at a time.** nghttp2 hands out its outgoing
+     * buffer a frame or so at a time and the pointer is only good until the next call, so the loop
+     * that copies is here rather than in every caller.
+     */
+    send(*self, out: *Buf[u8]) -> Result[usize, Error]
+        var total: usize = 0
+
+        loop
+            var p: *u8 = ptr_cast(0usize)
+
+            val n = c.session_mem_send2(self.s, &p)
+
+            if n < 0 then return Err(failing(i32(n), "writing what this end owes"))
+            if n == 0 then break
+
+            out.extend(p[0..<usize(n)])
+
+            total += usize(n)
+
+        Ok(total)
+    end send
+
+    /** Whether the session still expects bytes from the peer. */
+    wants_read(self) -> bool = c.session_want_read(self.s) != 0
+
+    /** Whether the session has bytes to write. `send` is what takes them. */
+    wants_write(self) -> bool = c.session_want_write(self.s) != 0
+
+    // -- events --------------------------------------------------------------------------------
+
+    /** The next thing the peer did, or `None` when everything received so far has been read. */
+    next_event(*self) -> Option[Event]
+        if self.head >= self.events.len()
+            self.events.clear()
+            self.head = 0
+
+            return None
+
+        val e = self.events.at(self.head)
+
+        self.head += 1
+
+        Some(e)
+    end next_event
+
+    // -- submitting ----------------------------------------------------------------------------
+
+    /** Open a stream and send a request on it. Answers the stream identifier.
+     *
+     * A client's call. `body` absent means the request ends with its headers, which is what a GET
+     * is; present means a DATA frame follows and the stream ends after it.
+     */
+    request(*self, headers: []const Header, body: Option[[]const u8] = None,
+        trailers: Option[[]const Header] = None) -> Result[i32, Error]
+
+        var nva = to_nva(headers)
+        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+
+        val id = c.submit_request2(self.s, ptr_cast(0usize), as_ptr(nva.view()), nva.len(),
+            if sends_data(body, trailers) then &prd else ptr_cast(0usize), ptr_cast(0usize))
+
+        if id < 0 then return Err(failing(id, "submitting a request"))
+
+        // **Registered after the submit, because the stream identifier is what the submit answers.**
+        // Nothing is written until `send`, so the body is in place well before the read callback
+        // can ask for it.
+        self.hold(id, body, trailers)
+
+        Ok(id)
+    end request
+
+    /** Send a response on a stream a request arrived on.
+     *
+     * A server's call. `body` absent means the response is headers alone, which is what a 204 or a
+     * 304 is.
+     */
+    respond(*self, stream: i32, headers: []const Header, body: Option[[]const u8] = None,
+        trailers: Option[[]const Header] = None) -> Result[unit, Error]
+
+        var nva = to_nva(headers)
+        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+
+        self.hold(stream, body, trailers)
+
+        val r = c.submit_response2(self.s, stream, as_ptr(nva.view()), nva.len(),
+            if sends_data(body, trailers) then &prd else ptr_cast(0usize))
+
+        if r != 0 then return Err(failing(r, "submitting a response"))
+
+        Ok(())
+    end respond
+
+    private hold(*self, stream: i32, body: Option[[]const u8], trailers: Option[[]const Header])
+        if !sends_data(body, trailers) then return
+
+        var held: Buf[u8] = buf()
+
+        body match
+            Some(bs) -> held.extend(bs)
+            None -> ()
+
+        var tail: Buf[Header] = buf()
+
+        trailers match
+            Some(ts) -> tail.extend(ts)
+            None -> ()
+
+        self.bodies.push(Body(stream, held, 0, tail, tail.len() > 0))
+    end hold
+
+    /** Send SETTINGS. A session sends an empty one when it is made, which is what the protocol
+     * requires; this is for saying something in particular.
+     */
+    settings(*self, values: []const Setting) -> Result[unit, Error]
+        var iv: Buf[c.SettingsEntry] = buf()
+
+        for v in values
+            iv.push(entry(v))
+
+        val r = c.submit_settings(self.s, c.FLAG_NONE, as_ptr(iv.view()), iv.len())
+
+        if r != 0 then Err(failing(r, "submitting SETTINGS")) else Ok(())
+    end settings
+
+    /** Tell the peer this connection is closing: the last stream that will be processed, and why.
+     *
+     * **A GOAWAY is a promise rather than a hangup.** Streams up to `last_stream` are still served;
+     * it is the ones above it the peer must retry elsewhere. `terminate` is the other one.
+     */
+    goaway(*self, last_stream: i32, code: u32 = c.NO_ERROR) -> Result[unit, Error]
+        val r = c.submit_goaway(self.s, c.FLAG_NONE, last_stream, code, ptr_cast(0usize), 0)
+
+        if r != 0 then Err(failing(r, "submitting GOAWAY")) else Ok(())
+    end goaway
+
+    /** Close the connection now: a GOAWAY naming the last stream nghttp2 processed, and no more
+     * frames after it. What a server does when it is going down rather than draining.
+     */
+    terminate(*self, code: u32 = c.NO_ERROR) -> Result[unit, Error]
+        val r = c.session_terminate_session(self.s, code)
+
+        if r != 0 then Err(failing(r, "terminating the session")) else Ok(())
+    end terminate
+
+    /** Give up on one stream. */
+    reset(*self, stream: i32, code: u32) -> Result[unit, Error]
+        val r = c.submit_rst_stream(self.s, c.FLAG_NONE, stream, code)
+
+        if r != 0 then Err(failing(r, "submitting RST_STREAM")) else Ok(())
+    end reset
+
+    /** Extend a flow-control window: `stream` 0 is the connection's. */
+    window_update(*self, stream: i32, increment: i32) -> Result[unit, Error]
+        val r = c.submit_window_update(self.s, c.FLAG_NONE, stream, increment)
+
+        if r != 0 then Err(failing(r, "submitting WINDOW_UPDATE")) else Ok(())
+    end window_update
+
+    /** Ask the peer to answer, which is how a connection is checked for life. The reply arrives as
+     * `Ping(true)`.
+     */
+    ping(*self) -> Result[unit, Error]
+        val r = c.submit_ping(self.s, c.FLAG_NONE, ptr_cast(0usize))
+
+        if r != 0 then Err(failing(r, "submitting PING")) else Ok(())
+    end ping
+
+    // -- flow control --------------------------------------------------------------------------
+
+    /** Tell the session bytes it handed over have been dealt with, so the window may be extended.
+     *
+     * Only needed where automatic window updates have been turned off; a default session extends
+     * its own windows.
+     */
+    consume(*self, stream: i32, size: usize) -> Result[unit, Error]
+        val r = c.session_consume(self.s, stream, size)
+
+        if r != 0 then Err(failing(r, "reporting consumed bytes")) else Ok(())
+    end consume
+
+    /** How many bytes this end may still send on the connection before the peer must give credit. */
+    remote_window(self) -> i32 = c.session_get_remote_window_size(self.s)
+
+    /** The same, for one stream. A stream is bounded by both its own window and the connection's. */
+    stream_remote_window(self, stream: i32) -> i32 =
+        c.session_get_stream_remote_window_size(self.s, stream)
+
+    /** How many bytes the peer may send this end on the connection. */
+    local_window(self) -> i32 = c.session_get_local_window_size(self.s)
+
+    /** What the peer asked for, for one SETTINGS parameter. */
+    peer_setting(self, s: Setting) -> u32 = c.session_get_remote_settings(self.s, entry(s).settings_id)
+
+    /** The highest stream identifier this end has processed -- what a GOAWAY should name. */
+    last_stream(self) -> i32 = c.session_get_last_proc_stream_id(self.s)
+end Session
+
+impl Drop for Session
+    drop(self) = c.session_del(self.s)
+
+// -- the callbacks ------------------------------------------------------------------------------
+//
+// **Each of these is handed the session's own address as nghttp2's user data**, which is the whole
+// of how a C callback finds its way back to a sysl value. It is the shape `sh.sysl.openssl`'s ALPN
+// callback uses and the one `~/dev/sysl-lang/CLAUDE.md` prescribes; nghttp2 makes it easy by having
+// a user-data slot, where `sh.sysl.llhttp` has to offset from the handle's address instead.
+//
+// **None of them takes an aggregate by value, which is why `&f` is an address nghttp2 can call.**
+// A callback taking a struct by value would need `@export`, and would therefore not be able to be
+// one of several -- the survey checked, and nghttp2 has none.
+
+private held(user: *u8) -> *Session = ptr_cast(user)
+
+// Whether a stream needs a DATA provider at all. **Trailers need one even with no body**, because
+// the only place a trailer block may be submitted is inside the read callback -- so a response of
+// headers and trailers alone still goes through a provider that hands over nothing.
+private sends_data(body: Option[[]const u8], trailers: Option[[]const Header]) -> bool =
+    body match
+        Some(_) -> true
+        None -> trailers match
+            Some(ts) -> ts.len > 0
+            None -> false
+
+private kind_of(cat: i32) -> HeaderKind =
+    if cat == c.HCAT_REQUEST then Request
+    else if cat == c.HCAT_RESPONSE then Response
+    else if cat == c.HCAT_PUSH_RESPONSE then PushResponse
+    else Trailer
+
+private on_begin_headers(s: *c.Session, f: *c.Frame, user: *u8) -> i32
+    var sess = held(user)
+
+    sess.pending.clear()
+
+    0
+end on_begin_headers
+
+// **The bytes belong to nghttp2 and are gone when this returns**, so each field is copied into a
+// `string` here. That copy is why `Event.Headers` carries owned headers rather than views.
+private on_header(s: *c.Session, f: *c.Frame, name: *u8, namelen: usize, value: *u8,
+    valuelen: usize, flags: u8, user: *u8) -> i32
+
+    var sess = held(user)
+
+    sess.pending.push(Header(from_utf8_unchecked(name[0..<namelen]),
+        from_utf8_unchecked(value[0..<valuelen]), (flags & c.NV_FLAG_NO_INDEX) != 0))
+
+    0
+end on_header
+
+private on_data_chunk(s: *c.Session, flags: u8, stream: i32, data: *u8, len: usize,
+    user: *u8) -> i32
+
+    var sess = held(user)
+
+    var chunk: Buf[u8] = buf()
+
+    chunk.extend(data[0..<len])
+
+    sess.events.push(Data(stream, chunk))
+
+    0
+end on_data_chunk
+
+private on_stream_close(s: *c.Session, stream: i32, code: u32, user: *u8) -> i32
+    var sess = held(user)
+
+    sess.events.push(StreamClose(stream, code))
+
+    0
+end on_stream_close
+
+// **One callback for every frame, dispatching on `hd.ty`.** The frame is a union whose arms all
+// begin with the header, so the type byte is readable from the union's own address and the arm is
+// reached by casting the same pointer -- which is what nghttp2's own C writes as `frame->goaway`.
+private on_frame(s: *c.Session, f: *c.Frame, user: *u8) -> i32
+    var sess = held(user)
+
+    val hd: *c.FrameHd = ptr_cast(f)
+
+    val ty = hd.ty
+    val flags = hd.flags
+    val stream = hd.stream_id
+
+    if ty == c.FRAME_HEADERS
+        val h: *c.HeadersFrame = ptr_cast(f)
+
+        var block: Buf[Header] = buf()
+
+        block.extend(sess.pending.view())
+        sess.pending.clear()
+
+        sess.events.push(Headers(stream, block, kind_of(h.cat)))
+    else if ty == c.FRAME_RST_STREAM
+        val r: *c.RstStreamFrame = ptr_cast(f)
+
+        sess.events.push(RstStream(stream, r.error_code))
+    else if ty == c.FRAME_SETTINGS
+        // **An ACK is not news.** The same bit means END_STREAM on a HEADERS and ACK here, which is
+        // the wire format's doing; a caller wants to hear that the peer's settings arrived, not
+        // that its own were acknowledged.
+        if (flags & c.FLAG_ACK) == 0 then sess.events.push(Settings)
+    else if ty == c.FRAME_GOAWAY
+        val g: *c.GoawayFrame = ptr_cast(f)
+
+        sess.events.push(Goaway(g.last_stream_id, g.error_code))
+    else if ty == c.FRAME_WINDOW_UPDATE
+        val w: *c.WindowUpdateFrame = ptr_cast(f)
+
+        sess.events.push(WindowUpdate(stream, w.window_size_increment))
+    else if ty == c.FRAME_PING
+        sess.events.push(Ping((flags & c.FLAG_ACK) != 0))
+
+    // **END_STREAM is a flag on a frame rather than a frame of its own**, and it is reported as its
+    // own event so that a caller has one thing to watch for whether the peer ended the stream with
+    // its headers or after a body.
+    if (flags & c.FLAG_END_STREAM) != 0 && (ty == c.FRAME_HEADERS || ty == c.FRAME_DATA)
+        sess.events.push(StreamEnd(stream))
+
+    0
+end on_frame
+
+// Where a DATA frame's bytes come from.
+//
+// **nghttp2 pulls rather than being pushed**, because a DATA frame is written when the flow-control
+// window allows rather than when the body was submitted. So the body is held on the session and
+// this hands over as much of it as was asked for.
+private pull(s: *c.Session, stream: i32, out: *u8, length: usize, data_flags: *u32, source: *u8,
+    user: *u8) -> isize
+
+    var sess = held(user)
+
+    var i: usize = 0
+
+    while i < sess.bodies.len()
+        var b = sess.bodies.at(i)
+
+        if b.stream == stream
+            val left = b.bytes.len() - b.sent
+            val n = if left < length then left else length
+
+            if n > 0 then copy(out[0..<n], b.bytes.view()[b.sent..<(b.sent + n)])
+
+            b.sent += n
+
+            if b.sent == b.bytes.len()
+                // **Trailers are submitted from in here, which is the only moment they are legal.**
+                // `NO_END_STREAM` beside `EOF` says the body is finished but the stream is not, so
+                // there is somewhere for a header block to go; without it nghttp2 closes the stream
+                // with the last DATA frame and the trailers are dropped in silence.
+                if b.has_trailers
+                    *data_flags = c.DATA_FLAG_EOF | c.DATA_FLAG_NO_END_STREAM
+
+                    var tail = to_nva(b.trailers.view())
+
+                    c.submit_trailer(s, stream, as_ptr(tail.view()), tail.len())
+                else
+                    *data_flags = c.DATA_FLAG_EOF
+
+                sess.bodies.remove(i)
+            else
+                sess.bodies.set(i, b)
+
+            return isize(n)
+
+        i += 1
+
+    // **A stream with no body registered ends here rather than hanging.** It is what a caller gets
+    // for submitting a data provider and no bytes, and answering EOF is the honest reading of that.
+    *data_flags = c.DATA_FLAG_EOF
+
+    0
+end pull
+
+// -- making one ---------------------------------------------------------------------------------
+
+private make(server: bool) -> Result[&Session, Error]
+    var cbs: *c.Callbacks = ptr_cast(0usize)
+
+    val made = c.callbacks_new(&cbs)
+
+    if made != 0 then return Err(failing(made, "making a callback table"))
+
+    c.callbacks_set_on_frame_recv(cbs, &on_frame)
+    c.callbacks_set_on_header(cbs, &on_header)
+    c.callbacks_set_on_begin_headers(cbs, &on_begin_headers)
+    c.callbacks_set_on_data_chunk_recv(cbs, &on_data_chunk)
+    c.callbacks_set_on_stream_close(cbs, &on_stream_close)
+
+    var s: *c.Session = ptr_cast(0usize)
+
+    var opened: i32 = 0
+
+    if server
+        opened = c.session_server_new(&s, cbs, ptr_cast(0usize))
+    else
+        opened = c.session_client_new(&s, cbs, ptr_cast(0usize))
+
+    // **Freed immediately, because nghttp2 copies the table into the session.** Keeping it beside
+    // the session would be a second thing to free and nothing would ever read it.
+    c.callbacks_del(cbs)
+
+    if opened != 0 then return Err(failing(opened, "making a session"))
+
+    val box: &Session = Session(s, buf(), 0, buf(), buf())
+
+    // **The box's own address, which is what every callback above is handed.** A `&T` does not
+    // move, so this stays true for as long as the session does -- and the session cannot outlive
+    // the box, because dropping the box is what deletes it.
+    c.session_set_user_data(s, ptr_cast(&*box))
+
+    // **The protocol requires SETTINGS as the first frame, so an empty one goes out here.** A
+    // session that never sent one leaves the peer waiting for something that never comes, and the
+    // symptom is a connection that opens and then does nothing at all.
+    val settled = c.submit_settings(s, c.FLAG_NONE, ptr_cast(0usize), 0)
+
+    if settled != 0 then return Err(failing(settled, "queuing the opening SETTINGS"))
+
+    Ok(box)
+end make
+
+/** A client session. Its first bytes out are the connection preface and an empty SETTINGS. */
+client() -> Result[&Session, Error] = make(false)
+
+/** A server session. */
+server() -> Result[&Session, Error] = make(true)

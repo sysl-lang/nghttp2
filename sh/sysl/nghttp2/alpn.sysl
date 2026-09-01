@@ -1,0 +1,62 @@
+// The one place this package and a TLS binding meet.
+//
+// **HTTP/2 over TLS is chosen by ALPN and by nothing else.** A client offers a list of protocol
+// names in its ClientHello, the server picks one, and `h2` is the name that means this. There is no
+// upgrade handshake and no version header: a connection either negotiated `h2` or it did not.
+//
+// **The list is a wire format rather than a list of strings** -- each name a length byte and then
+// that many bytes -- which is why the check below takes bytes. `sh.sysl.openssl` builds exactly
+// that shape from `[]const string` at both ends, so the two packages meet at a slice and neither
+// has to know the other exists.
+//
+//     sv.offer(["h2", "http/1.1"])            // sh.sysl.openssl, before the handshake
+//     conn.alpn() match                        // ... and after it
+//         Some("h2") -> ...                    // hand the bytes to a sh.sysl.nghttp2 session
+//         _ -> ...                             // HTTP/1.1, or the peer offered nothing
+
+module sh.sysl.nghttp2
+
+import sh.sysl.nghttp2.c
+import sysl.slices.as_ptr
+import sysl.buf.{Buf, buf}
+
+/** Whether a wire-format ALPN list offers `h2`.
+ *
+ * **nghttp2's own answer rather than a scan written here**, which matters because the question is
+ * not quite "does the list contain those two bytes": nghttp2 knows which protocol identifiers it
+ * implements and would pick a later one if it grew one.
+ *
+ * A server has no need for this where its TLS binding already selects by the server's own
+ * preference -- `sh.sysl.openssl`'s `offer` does -- and it is what a client uses to check what it
+ * got, and what a server with a hand-rolled selection callback uses to decide.
+ */
+offers_h2(offered: []const u8) -> bool
+    if offered.len == 0 then return false
+
+    var name: *u8 = ptr_cast(0usize)
+    var namelen: u8 = 0
+
+    c.select_alpn(&name, &namelen, as_ptr(offered), u32(offered.len)) == 1
+end offers_h2
+
+/** A protocol list in ALPN's wire form: each name a length byte and then that many bytes.
+ *
+ * Here because a program that has no TLS binding in hand still needs the shape to test against, and
+ * because `offers_h2` takes it. A name that is empty or longer than 255 bytes cannot be carried and
+ * is refused.
+ */
+alpn_list(protocols: []const string) -> Result[Buf[u8], Error]
+    var out: Buf[u8] = buf()
+
+    for name in protocols
+        val bytes = name.bytes
+
+        if bytes.len == 0 || bytes.len > 255
+            return Err(Error(c.ERR_INVALID_ARGUMENT,
+                s"`${name}` is not a protocol name ALPN can carry"))
+
+        out.push(u8(bytes.len))
+        out.extend(bytes)
+
+    Ok(out)
+end alpn_list
