@@ -1,0 +1,225 @@
+// HPACK, on its own -- header compression without a session.
+//
+// **This tier is usable without any of the rest of the package, which is why it is a file of its
+// own.** HPACK is the fiddly, security-relevant half of HTTP/2: it carries a dynamic table that
+// both ends must keep in step, and a decoder that trusts its input is a decompression bomb waiting
+// for somebody to send it one. It is also identical whoever drives the frames -- an HTTP/3 QPACK
+// implementation is a different algorithm, but an HTTP/2 proxy, a test harness and a session all
+// want exactly this.
+//
+// **A deflater and an inflater are each a conversation, not a function.** The dynamic table is
+// built from every block that has gone through, so blocks must be given to one inflater in the
+// order they arrived and a fresh inflater cannot pick up mid-stream. That is HPACK's design rather
+// than this binding's: it is what makes the second request on a connection cost a handful of bytes.
+
+module sh.sysl.nghttp2
+
+import sh.sysl.nghttp2.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.from_utf8_unchecked
+
+/** One header field.
+ *
+ * **`sensitive` is not a comment, it is a wire decision.** A field marked sensitive is encoded so
+ * that it never enters the dynamic table and never gets an index -- which is what stops an attacker
+ * who can insert requests from learning a secret header's value by watching how well it compresses.
+ * `authorization` and `cookie` are the ones that want it.
+ */
+struct Header
+    name: string
+    value: string
+    sensitive: bool
+end Header
+
+/** A header field, indexed normally -- the ordinary case. */
+header(name: string, value: string) -> Header = Header(name, value, false)
+
+/** A header field that must never be indexed. Use it for anything an attacker must not learn by
+ * measuring the compression: credentials, session cookies, capability tokens.
+ */
+sensitive(name: string, value: string) -> Header = Header(name, value, true)
+
+/** Whether nghttp2 would accept this as a header field name -- lowercase, no separators, not empty.
+ *
+ * **HTTP/2 requires lowercase field names**, which is the rule that catches everyone porting from
+ * HTTP/1.1, and it is the library's own check rather than a second opinion written here.
+ */
+valid_name(name: string) -> bool
+    val b = name.bytes
+
+    b.len > 0 && c.check_header_name(as_ptr(b), b.len) != 0
+end valid_name
+
+/** Whether nghttp2 would accept this as a header field value. */
+valid_value(value: string) -> bool
+    val b = value.bytes
+
+    c.check_header_value(as_ptr(b), b.len) != 0
+end valid_value
+
+// **The `Nv` array is built over the caller's own strings and nghttp2 copies out of it.** Nothing
+// here owns bytes: `as_ptr` on a `string`'s bytes names them where they already are, and both
+// `hd_deflate_hd2` and `submit_*` are done with the array before they return. The one rule that
+// falls out is that the `Header`s must outlive the call, which they do -- they are the caller's
+// slice.
+private[nghttp2] to_nv(h: Header) -> c.Nv
+    val n = h.name.bytes
+    val v = h.value.bytes
+
+    c.Nv(as_ptr(n), as_ptr(v), n.len, v.len,
+        if h.sensitive then c.NV_FLAG_NO_INDEX else c.NV_FLAG_NONE)
+end to_nv
+
+private[nghttp2] to_nva(headers: []const Header) -> Buf[c.Nv]
+    var nva: Buf[c.Nv] = buf()
+
+    for h in headers
+        nva.push(to_nv(h))
+
+    nva
+end to_nva
+
+// -- the encoder ------------------------------------------------------------------------------
+
+/** An HPACK encoder, and the dynamic table it is building.
+ *
+ * **A `&Deflater` because nghttp2 allocated it** and `nghttp2_hd_deflate_del` is owed exactly once;
+ * a destructor only runs for a value something owns through a box, so a constructor answering a
+ * bare `Deflater` would leak one encoder per call and compress perfectly the whole time.
+ */
+struct Deflater
+    private d: *c.HdDeflater
+
+    /** A header block, encoded.
+     *
+     * **The size is asked of nghttp2 rather than guessed**: `nghttp2_hd_deflate_bound` answers the
+     * largest the block could possibly come to for these fields and this table, so the encode
+     * cannot run short and there is no grow-and-retry loop.
+     */
+    deflate(*self, headers: []const Header) -> Result[Buf[u8], Error]
+        var nva = to_nva(headers)
+
+        val p = as_ptr(nva.view())
+        val bound = c.hd_deflate_bound(self.d, p, nva.len())
+
+        var scratch: []u8 = [0; bound]
+
+        val n = c.hd_deflate_hd2(self.d, as_mut_ptr(scratch), bound, p, nva.len())
+
+        if n < 0 then return Err(failing(i32(n), "encoding a header block"))
+
+        var out: Buf[u8] = buf()
+
+        out.extend(scratch[0..<usize(n)])
+
+        Ok(out)
+    end deflate
+
+    /** Tell the encoder the peer has lowered SETTINGS_HEADER_TABLE_SIZE.
+     *
+     * A session does this itself when the peer's SETTINGS arrive. It is here for the tier used on
+     * its own, where nothing else is watching the settings.
+     */
+    resize_table(*self, size: usize) -> Result[unit, Error]
+        val r = c.hd_deflate_change_table_size(self.d, size)
+
+        if r != 0 then Err(failing(r, "resizing the encoder's dynamic table")) else Ok(())
+end Deflater
+
+impl Drop for Deflater
+    drop(self) = c.hd_deflate_del(self.d)
+
+/** An HPACK encoder whose dynamic table holds at most `max_table` bytes.
+ *
+ * 4096 is HTTP/2's default and what a peer assumes until it says otherwise. **Zero is legal and
+ * means "index nothing"**, which costs bytes and removes the compression side channel entirely.
+ */
+deflater(max_table: usize = 4096) -> Result[&Deflater, Error]
+    var d: *c.HdDeflater = ptr_cast(0usize)
+
+    val r = c.hd_deflate_new(&d, max_table)
+
+    if r != 0 then return Err(failing(r, "making an HPACK encoder"))
+
+    Ok(Deflater(d))
+end deflater
+
+// -- the decoder ------------------------------------------------------------------------------
+
+/** An HPACK decoder, and the dynamic table it is building.
+ *
+ * **A `&Inflater` for the reason a `&Deflater` is one**: nghttp2 allocated it and is owed a
+ * `nghttp2_hd_inflate_del`.
+ */
+struct Inflater
+    private i: *c.HdInflater
+
+    /** One header block, decoded.
+     *
+     * `final` says this is the whole block rather than a piece of one -- a block split across
+     * CONTINUATION frames is handed over piece by piece with `false` until the last. Passing `true`
+     * for a partial block leaves the dynamic table wrong for every block after it.
+     *
+     * **The bytes a field arrives in belong to the decoder and are gone by the next call**, so each
+     * one is copied into a `string` here. That copy is the whole reason this returns owned headers
+     * rather than views.
+     */
+    inflate(*self, block: []const u8, final: bool = true) -> Result[Buf[Header], Error]
+        var out: Buf[Header] = buf()
+
+        var nv = c.Nv(ptr_cast(0usize), ptr_cast(0usize), 0, 0, 0)
+        var flags: i32 = 0
+
+        var rest = block
+
+        loop
+            val n = c.hd_inflate_hd3(self.i, &nv, &flags, as_ptr(rest), rest.len,
+                if final then 1 else 0)
+
+            if n < 0 then return Err(failing(i32(n), "decoding a header block"))
+
+            rest = rest[usize(n)..]
+
+            if (flags & c.HD_INFLATE_EMIT) != 0
+                out.push(Header(from_utf8_unchecked(nv.name[0..<nv.namelen]),
+                    from_utf8_unchecked(nv.value[0..<nv.valuelen]),
+                    (nv.flags & c.NV_FLAG_NO_INDEX) != 0))
+
+            if (flags & c.HD_INFLATE_FINAL) != 0
+                c.hd_inflate_end_headers(self.i)
+                break
+
+            // **Nothing emitted and nothing left is how a partial block ends**, and it is the one
+            // exit that is not the decoder's doing. Without it a block handed over with
+            // `final = false` spins here asking to decode no bytes.
+            if (flags & c.HD_INFLATE_EMIT) == 0 && rest.len == 0 then break
+
+        Ok(out)
+    end inflate
+
+    /** Tell the decoder this end has lowered SETTINGS_HEADER_TABLE_SIZE. */
+    resize_table(*self, size: usize) -> Result[unit, Error]
+        val r = c.hd_inflate_change_table_size(self.i, size)
+
+        if r != 0 then Err(failing(r, "resizing the decoder's dynamic table")) else Ok(())
+end Inflater
+
+impl Drop for Inflater
+    drop(self) = c.hd_inflate_del(self.i)
+
+/** An HPACK decoder.
+ *
+ * **It takes no table size, unlike the encoder.** The decoder's table is sized by what the *peer*
+ * was told in SETTINGS, which is this end's own SETTINGS_HEADER_TABLE_SIZE -- so it is set with
+ * `resize_table` when that changes, rather than chosen when the decoder is made.
+ */
+inflater() -> Result[&Inflater, Error]
+    var i: *c.HdInflater = ptr_cast(0usize)
+
+    val r = c.hd_inflate_new(&i)
+
+    if r != 0 then return Err(failing(r, "making an HPACK decoder"))
+
+    Ok(Inflater(i))
+end inflater

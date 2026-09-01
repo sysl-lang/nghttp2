@@ -1,0 +1,48 @@
+// What went wrong, in nghttp2's own words where it has any.
+
+module sh.sysl.nghttp2
+
+import sh.sysl.nghttp2.c
+import sysl.text.from_cstring
+
+/** A failure, carrying nghttp2's own code and the sentence it prints for it.
+ *
+ * **There are two error spaces in HTTP/2 and this is only one of them.** `code` here is a
+ * *library* error -- always negative, never on the wire, meaning something like "that argument
+ * cannot be right" or "out of memory". The codes that travel in a RST_STREAM or a GOAWAY are
+ * unsigned and are a different set entirely; they arrive as an `Event` rather than as an `Error`,
+ * because a peer resetting a stream is news rather than a fault in this program.
+ */
+struct Error
+    code: i32
+    message: string
+
+    /** Whether nghttp2 considers this failure fatal to the session.
+     *
+     * A non-fatal error means the call did not happen and the session is still usable -- an
+     * argument that was refused, a stream that has already closed. A fatal one means the session's
+     * own state is gone and every later call on it will fail; the only thing to do is drop it.
+     */
+    fatal(self) -> bool = c.is_fatal(self.code) != 0
+end Error
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.message, out, fmt)
+
+// **nghttp2's own sentence for a code, or the number if it is not UTF-8.** `from_cstring` is
+// fallible because nothing about a `char *` promises well-formed text; nghttp2's strings are ASCII
+// literals in its own source, so the fallback is unreachable rather than merely unlikely -- and it
+// is written out anyway, because a message is not worth a panic.
+private said(code: i32) -> string = from_cstring(c.strerror(code)).unwrap_or(s"nghttp2 error ${code}")
+
+private[nghttp2] fail(code: i32) -> Error = Error(code, said(code))
+
+private[nghttp2] failing(code: i32, what: string) -> Error = Error(code, s"${what}: ${said(code)}")
+
+/** The name HTTP/2 gives a wire error code -- what a peer said when it reset a stream or went away.
+ *
+ * Separate from `Error` on purpose: these are the peer's verdict rather than this end's, and a
+ * `CANCEL` on one stream is an ordinary thing for a browser to send.
+ */
+error_name(code: u32) -> string =
+    from_cstring(c.http2_strerror(code)).unwrap_or(s"HTTP/2 error ${code}")

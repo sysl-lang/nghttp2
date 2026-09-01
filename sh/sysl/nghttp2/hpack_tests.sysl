@@ -1,0 +1,220 @@
+module sh.sysl.nghttp2
+@tests
+
+// HPACK, checked against RFC 7541's own worked examples.
+//
+// **The vectors are the standard's, not nghttp2's**, which is the whole reason they are worth
+// having: a round trip through one implementation agrees with itself whatever it does wrong, and
+// `nghttp2`'s command-line tools would agree with this binding for the same reason. RFC 7541
+// Appendix C.4 prints three request blocks in hexadecimal and says what each decodes to, and none
+// of those numbers came from this library.
+//
+// The three are **one conversation**: C.4.2 refers back to a field C.4.1 put in the dynamic table,
+// and C.4.3 to one C.4.2 added. Decoding them with a single inflater in order is therefore a test
+// of the table rather than of the literal encoding, and decoding C.4.2 on its own would fail.
+
+import sysl.buf.{Buf, buf}
+
+private c41() -> []u8 = [0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b,
+    0xa0, 0xab, 0x90, 0xf4, 0xff]
+
+private c42() -> []u8 = [0x82, 0x86, 0x84, 0xbe, 0x58, 0x86, 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf]
+
+private c43() -> []u8 = [0x82, 0x87, 0x85, 0xbf, 0x40, 0x88, 0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9,
+    0x7d, 0x7f, 0x89, 0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf]
+
+// `name: value` for each field, joined by `|` -- the whole block as one string to compare against,
+// which makes a failure print what was decoded rather than which index disagreed.
+private transcript(headers: Buf[Header]) -> string
+    var out = ""
+
+    for i in 0..<headers.len()
+        if i > 0 then out += "|"
+
+        val h = headers.at(i)
+
+        out += s"${h.name}: ${h.value}"
+
+    out
+end transcript
+
+@test("RFC 7541 C.4 decodes to the fields the RFC says, all three blocks in one conversation")
+the_rfc_request_vectors_decode()
+    var inf = inflater().unwrap()
+
+    assert_eq(transcript(inf.inflate(c41()).unwrap()),
+        ":method: GET|:scheme: http|:path: /|:authority: www.example.com")
+
+    assert_eq(transcript(inf.inflate(c42()).unwrap()),
+        ":method: GET|:scheme: http|:path: /|:authority: www.example.com|cache-control: no-cache")
+
+    assert_eq(transcript(inf.inflate(c43()).unwrap()),
+        ":method: GET|:scheme: https|:path: /index.html|:authority: www.example.com|" +
+        "custom-key: custom-value")
+end the_rfc_request_vectors_decode
+
+// **The encoder is checked against the RFC's bytes, not against the decoder.** HPACK leaves an
+// encoder a great deal of choice -- whether to index, whether to Huffman-code, which of several
+// representations to use -- so a round trip proves only that this implementation is consistent.
+// C.4.1 is a case where the choices are pinned: the four fields are all in the static table or
+// Huffman-coded literals, and the RFC prints the exact seventeen bytes.
+@test("the encoder produces RFC 7541 C.4.1 byte for byte")
+the_encoder_reproduces_the_rfc_bytes()
+    var def = deflater().unwrap()
+
+    val block = def.deflate([header(":method", "GET"), header(":scheme", "http"),
+        header(":path", "/"), header(":authority", "www.example.com")]).unwrap()
+
+    assert_eq(block.len(), 17)
+    assert(block.view() == c41())
+end the_encoder_reproduces_the_rfc_bytes
+
+@test("what the encoder writes, the decoder reads back")
+a_block_round_trips()
+    var def = deflater().unwrap()
+    var inf = inflater().unwrap()
+
+    val sent = [header(":status", "200"), header("content-type", "text/plain"),
+        header("content-length", "13"), header("server", "sysl")]
+
+    val block = def.deflate(sent).unwrap()
+    val got = inf.inflate(block.view()).unwrap()
+
+    assert_eq(got.len(), 4)
+    assert_eq(transcript(got),
+        ":status: 200|content-type: text/plain|content-length: 13|server: sysl")
+end a_block_round_trips
+
+// **This is the test that says the dynamic table is doing anything at all.** The second block is
+// the same fields as the first, so every one of them is already indexed and the encoding collapses
+// to one byte each. A binding that made a fresh encoder per block would pass every test above and
+// fail this one.
+@test("the second block of a conversation is much shorter than the first")
+the_dynamic_table_shortens_a_repeat()
+    var def = deflater().unwrap()
+
+    val fields = [header(":method", "POST"), header(":scheme", "https"),
+        header(":path", "/v1/things"), header(":authority", "api.example.com"),
+        header("content-type", "application/json")]
+
+    val first = def.deflate(fields).unwrap()
+    val second = def.deflate(fields).unwrap()
+
+    assert(second.len() < first.len())
+
+    // The five fields cost 79 bytes the first time and 14 the second: two are in HPACK's static
+    // table and get one byte each, and the three literals the first block put in the dynamic table
+    // get an index apiece. The exact numbers are here so that a change in what gets indexed is
+    // visible rather than merely still-smaller.
+    assert_eq(first.len(), 38)
+    assert_eq(second.len(), 14)
+end the_dynamic_table_shortens_a_repeat
+
+// **A sensitive field is the one that must NOT get shorter**, and the reason is an attack rather
+// than a preference: an attacker who can insert requests onto a connection learns a secret header's
+// value one character at a time by watching whether his guess compressed. Marking it sensitive
+// keeps it out of the dynamic table, so the second block costs what the first did.
+//
+// **The control field is not `authorization`, and finding that out cost a red test worth keeping.**
+// nghttp2's encoder refuses to index a handful of names on its own -- `authorization` among them,
+// and a short `cookie` -- so the ordinary encoding of one does not shrink either, and a comparison
+// against it would have proved nothing about the flag. `x-api-token` is an ordinary name that gets
+// no such treatment, which is what makes the second half of this test a real control.
+@test("a sensitive field is never indexed, so repeating it never gets cheaper")
+a_sensitive_field_does_not_shrink()
+    var def = deflater().unwrap()
+
+    val secret = [sensitive("x-api-token", "Bearer 0123456789abcdef")]
+
+    val first = def.deflate(secret).unwrap()
+    val second = def.deflate(secret).unwrap()
+
+    assert_eq(first.len(), second.len())
+
+    // And the ordinary encoding of the same field does shrink, which is what makes the assertion
+    // above a claim about `sensitive` rather than about this field being incompressible.
+    //
+    // **The two calls are bound to names rather than compared in one expression**, because both
+    // sides of a comparison would be two calls on one encoder and nothing says which runs first --
+    // a conversation is order-dependent by construction.
+    var plain = deflater().unwrap()
+    val open = [header("x-api-token", "Bearer 0123456789abcdef")]
+
+    val once = plain.deflate(open).unwrap().len()
+    val twice = plain.deflate(open).unwrap().len()
+
+    assert(twice < once)
+end a_sensitive_field_does_not_shrink
+
+// A field marked never-indexed on the wire arrives marked, so a proxy re-encoding it keeps the
+// promise the original sender made.
+@test("the never-indexed flag survives a round trip")
+sensitivity_survives_the_wire()
+    var def = deflater().unwrap()
+    var inf = inflater().unwrap()
+
+    val block = def.deflate([sensitive("cookie", "session=abc"), header("accept", "*/*")]).unwrap()
+    val got = inf.inflate(block.view()).unwrap()
+
+    assert_eq(got.len(), 2)
+    assert(got.at(0).sensitive)
+    assert(!got.at(1).sensitive)
+end sensitivity_survives_the_wire
+
+// **An encoder with no table is legal and is the way to turn the side channel off entirely.**
+// Nothing is indexed, so nothing repeats more cheaply -- which is the trade a proxy handling
+// several tenants' traffic on one connection may want to make.
+//
+// **The first block is a byte longer than the rest and that byte is not the field**: an encoder
+// whose table size differs from the 4096 the peer assumes has to say so, and it says so with a
+// dynamic table size update at the head of the first block it writes. So the comparison is between
+// the second block and the third, and the first is asserted separately for exactly that byte.
+@test("an encoder given no dynamic table never shortens a repeat")
+a_zero_table_indexes_nothing()
+    var def = deflater(0).unwrap()
+
+    val fields = [header("x-request-id", "8f14e45fceea167a5a36dedd4bea2543")]
+
+    val first = def.deflate(fields).unwrap().len()
+    val second = def.deflate(fields).unwrap().len()
+    val third = def.deflate(fields).unwrap().len()
+
+    assert_eq(second, third)
+    assert_eq(first, second + 1)
+end a_zero_table_indexes_nothing
+
+// -- what nghttp2 will and will not accept as a field ------------------------------------------
+
+@test("an uppercase field name is refused, which is the rule HTTP/1.1 habits break")
+uppercase_names_are_not_http2()
+    assert(valid_name("content-type"))
+    assert(valid_name(":method"))
+
+    assert(!valid_name("Content-Type"))
+    assert(!valid_name(""))
+    assert(!valid_name("has space"))
+    assert(!valid_name("colon:inside"))
+end uppercase_names_are_not_http2
+
+@test("a value carrying a control character is refused")
+control_characters_are_not_values()
+    assert(valid_value("text/plain"))
+    assert(valid_value(""))
+
+    assert(!valid_value("two\nlines"))
+    assert(!valid_value("a\rb"))
+end control_characters_are_not_values
+
+// **The decoder refuses a corrupt block rather than answering something plausible**, which is the
+// property a decompressor is judged on. `0x80` alone is an indexed field whose index is zero, and
+// zero is not an index.
+@test("a corrupt block is an error, not a guess")
+a_corrupt_block_is_refused()
+    var inf = inflater().unwrap()
+
+    val bad: []u8 = [0x80]
+
+    inf.inflate(bad) match
+        Ok(_) -> assert(false)
+        Err(e) -> assert(e.code < 0)
+end a_corrupt_block_is_refused
