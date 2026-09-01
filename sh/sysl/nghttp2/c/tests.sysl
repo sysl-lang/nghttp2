@@ -1,0 +1,182 @@
+module sh.sysl.nghttp2.c
+@tests
+
+// The survey's questions, asked of the real compiler.
+//
+// **Every struct declared in this module is checked against the C one, and so is every field the
+// layer above reaches by name.** That is the whole safety of a shim-free binding whose frames are a
+// union: sysl reads `nghttp2_goaway.error_code` by laying its own struct over nghttp2's memory, and
+// nothing but these assertions relates the two layouts. A version of nghttp2 that adds a field to a
+// frame arm changes a number here and fails at the first `sysl test` rather than at a silently wrong
+// read.
+//
+// The numbers on the right were measured with a C program compiled against the installed header
+// before they were written here.
+
+// -- The structs that cross the boundary -------------------------------------------------------
+
+@test("the header-field struct is the size C says nghttp2_nv is")
+nv_layout_agrees_with_c()
+    assert_eq(sizeof(Nv), NV_SIZE)
+    assert_eq(NV_SIZE, 40)
+
+@test("the frame header is the size C says, and its fields are where C puts them")
+frame_hd_layout_agrees_with_c()
+    assert_eq(sizeof(FrameHd), FRAME_HD_SIZE)
+    assert_eq(FRAME_HD_SIZE, 16)
+
+    // **`ty` is `type` renamed, so this is the assertion that licenses the rename.** The field is
+    // read by every frame arm below; a wrong offset here would read the flags byte as the type and
+    // dispatch on it.
+    assert_eq(offsetof(FrameHd, ty), HD_TYPE_OFFSET)
+    assert_eq(offsetof(FrameHd, flags), HD_FLAGS_OFFSET)
+    assert_eq(offsetof(FrameHd, stream_id), HD_STREAM_ID_OFFSET)
+
+    assert_eq(HD_STREAM_ID_OFFSET, 8)
+    assert_eq(HD_TYPE_OFFSET, 12)
+    assert_eq(HD_FLAGS_OFFSET, 13)
+end frame_hd_layout_agrees_with_c
+
+@test("the priority spec, the settings entry and the data provider agree with C")
+small_structs_agree_with_c()
+    assert_eq(sizeof(PrioritySpec), PRIORITY_SPEC_SIZE)
+    assert_eq(sizeof(SettingsEntry), SETTINGS_ENTRY_SIZE)
+    assert_eq(sizeof(DataProvider), DATA_PROVIDER_SIZE)
+
+    assert_eq(PRIORITY_SPEC_SIZE, 12)
+    assert_eq(SETTINGS_ENTRY_SIZE, 8)
+    assert_eq(DATA_PROVIDER_SIZE, 16)
+end small_structs_agree_with_c
+
+// -- The frame arms ----------------------------------------------------------------------------
+//
+// Each of these is laid over the same union, so each one's *own* size has to match and the fields
+// read out of it have to sit where nghttp2 put them. A frame arm that grew a field would leave the
+// layer above reading past what it thought it had.
+
+@test("the HEADERS arm agrees with C, including the two fields read out of it")
+headers_frame_agrees_with_c()
+    assert_eq(sizeof(HeadersFrame), HEADERS_SIZE)
+    assert_eq(HEADERS_SIZE, 64)
+
+    assert_eq(offsetof(HeadersFrame, nva), HEADERS_NVA_OFFSET)
+    assert_eq(offsetof(HeadersFrame, cat), HEADERS_CAT_OFFSET)
+
+    assert_eq(HEADERS_NVA_OFFSET, 40)
+    assert_eq(HEADERS_CAT_OFFSET, 56)
+end headers_frame_agrees_with_c
+
+@test("the GOAWAY arm agrees with C, including the two numbers a caller is told")
+goaway_frame_agrees_with_c()
+    assert_eq(sizeof(GoawayFrame), GOAWAY_SIZE)
+    assert_eq(GOAWAY_SIZE, 48)
+
+    assert_eq(offsetof(GoawayFrame, last_stream_id), GOAWAY_LAST_OFFSET)
+    assert_eq(offsetof(GoawayFrame, error_code), GOAWAY_ERROR_OFFSET)
+
+    assert_eq(GOAWAY_LAST_OFFSET, 16)
+    assert_eq(GOAWAY_ERROR_OFFSET, 20)
+end goaway_frame_agrees_with_c
+
+@test("the RST_STREAM, SETTINGS, WINDOW_UPDATE and PING arms agree with C")
+remaining_frames_agree_with_c()
+    assert_eq(sizeof(RstStreamFrame), RST_STREAM_SIZE)
+    assert_eq(sizeof(SettingsFrame), SETTINGS_SIZE)
+    assert_eq(sizeof(WindowUpdateFrame), WINDOW_UPDATE_SIZE)
+    assert_eq(sizeof(PingFrame), PING_SIZE)
+
+    assert_eq(offsetof(RstStreamFrame, error_code), RST_ERROR_OFFSET)
+    assert_eq(offsetof(SettingsFrame, iv), SETTINGS_IV_OFFSET)
+    assert_eq(offsetof(WindowUpdateFrame, window_size_increment), WINDOW_INCR_OFFSET)
+    assert_eq(offsetof(PingFrame, opaque_data), PING_DATA_OFFSET)
+
+    assert_eq(RST_STREAM_SIZE, 24)
+    assert_eq(SETTINGS_SIZE, 32)
+    assert_eq(WINDOW_UPDATE_SIZE, 24)
+    assert_eq(PING_SIZE, 24)
+end remaining_frames_agree_with_c
+
+// -- The constants -----------------------------------------------------------------------------
+//
+// A `c const` reads an `enum` constant and not only a `#define`, which is what makes this binding
+// shim-free: every number nghttp2 publishes is an enumerator.
+
+@test("the frame types read as their wire values")
+frame_types_are_the_wire_numbers()
+    assert_eq(FRAME_DATA, 0)
+    assert_eq(FRAME_HEADERS, 1)
+    assert_eq(FRAME_PRIORITY, 2)
+    assert_eq(FRAME_RST_STREAM, 3)
+    assert_eq(FRAME_SETTINGS, 4)
+    assert_eq(FRAME_PUSH_PROMISE, 5)
+    assert_eq(FRAME_PING, 6)
+    assert_eq(FRAME_GOAWAY, 7)
+    assert_eq(FRAME_WINDOW_UPDATE, 8)
+    assert_eq(FRAME_CONTINUATION, 9)
+end frame_types_are_the_wire_numbers
+
+// **`ACK` and `END_STREAM` are the same bit and this says so.** They are read against different
+// frame types -- a SETTINGS or a PING carries an ACK, a HEADERS or a DATA carries an END_STREAM --
+// so anything dispatching on the bit alone is wrong, and the assertion is here so that a reader of
+// this file finds that out from a test rather than from a stalled connection.
+@test("ACK and END_STREAM are one bit, read against different frames")
+the_flag_bits_are_the_wire_bits()
+    assert_eq(FLAG_NONE, 0)
+    assert_eq(FLAG_END_STREAM, 1)
+    assert_eq(FLAG_ACK, 1)
+    assert_eq(FLAG_END_HEADERS, 4)
+    assert_eq(FLAG_PADDED, 8)
+    assert_eq(FLAG_PRIORITY, 32)
+end the_flag_bits_are_the_wire_bits
+
+@test("the SETTINGS identifiers read as their wire values")
+settings_ids_are_the_wire_numbers()
+    assert_eq(SETTINGS_HEADER_TABLE_SIZE, 1)
+    assert_eq(SETTINGS_ENABLE_PUSH, 2)
+    assert_eq(SETTINGS_MAX_CONCURRENT_STREAMS, 3)
+    assert_eq(SETTINGS_INITIAL_WINDOW_SIZE, 4)
+    assert_eq(SETTINGS_MAX_FRAME_SIZE, 5)
+    assert_eq(SETTINGS_MAX_HEADER_LIST_SIZE, 6)
+end settings_ids_are_the_wire_numbers
+
+// The two error spaces, which are easy to confuse because both are called "error code". The wire
+// codes are unsigned and travel in a frame; the library codes are negative and never leave the
+// process.
+@test("the two error spaces are separate and neither collides with the other")
+the_error_spaces_are_distinct()
+    assert_eq(NO_ERROR, 0)
+    assert_eq(PROTOCOL_ERROR, 1)
+    assert_eq(INTERNAL_ERROR, 2)
+    assert_eq(FLOW_CONTROL_ERROR, 3)
+    assert_eq(REFUSED_STREAM, 7)
+    assert_eq(CANCEL, 8)
+    assert_eq(ENHANCE_YOUR_CALM, 11)
+
+    assert(ERR_NOMEM < 0)
+    assert(ERR_CALLBACK_FAILURE < 0)
+    assert(ERR_DEFERRED < 0)
+    assert(ERR_PAUSE < 0)
+    assert(ERR_INSUFF_BUFSIZE < 0)
+end the_error_spaces_are_distinct
+
+@test("the HPACK inflater's output flags are the bits the loop tests")
+hpack_flags_are_bits()
+    assert_eq(HD_INFLATE_NONE, 0)
+    assert_eq(HD_INFLATE_FINAL, 1)
+    assert_eq(HD_INFLATE_EMIT, 2)
+end hpack_flags_are_bits
+
+@test("the header categories read as their C values")
+header_categories_are_read()
+    assert_eq(HCAT_REQUEST, 0)
+    assert_eq(HCAT_RESPONSE, 1)
+    assert_eq(HCAT_PUSH_RESPONSE, 2)
+    assert_eq(HCAT_HEADERS, 3)
+end header_categories_are_read
+
+// The connection preface is 24 bytes -- `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`. nghttp2 writes it
+// itself as the first thing out of a client session, and the session tests assert exactly that, so
+// the length is worth pinning here.
+@test("the client preface is the twenty-four bytes RFC 9113 names")
+client_magic_is_twenty_four_bytes()
+    assert_eq(CLIENT_MAGIC_LEN, 24)

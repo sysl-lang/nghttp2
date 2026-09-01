@@ -1,0 +1,46 @@
+// nghttp2 — HTTP/2 for sysl: HPACK, and a session that speaks the framing layer.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **nghttp2 has to be installed, and so do its headers.** Nothing is vendored: nghttp2 is a large C
+// project with its own build system and its own release cadence, and it is packaged everywhere.
+//
+//     brew install nghttp2            # macOS
+//     sudo apt install libnghttp2-dev # Debian / Ubuntu
+//     sudo pacman -S libnghttp2       # Arch
+//
+// **The build needs no flags**, because nghttp2 installs `libnghttp2.pc` beside itself and the
+// `pkg_config` requirement below asks the machine where it is.
+
+package {
+  name    = "nghttp2"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with. Lower it when
+  // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
+  sysl = "0.0.98"
+}
+
+// **`heap`, because every handle here is one nghttp2 allocated**: a session, a callbacks struct, an
+// HPACK deflater and an HPACK inflater are each a pointer the library hands back and takes away
+// again, and this package frees each of them exactly once. Nothing here asks a caller for storage
+// the way `sh.sysl.miniz` does — nghttp2 has no API that would let it.
+//
+// **No `posix`, and that is the whole point of the shape.** nghttp2 is never given a socket: bytes
+// the program received go in at `receive`, and bytes to write come out of `send`. HTTP/2 is then a
+// *transformation*, exactly as `sh.sysl.openssl` makes TLS one, and the two compose without either
+// of them knowing how the other reaches the wire.
+requires {
+  heap = true
+
+  pkg_config {
+    libnghttp2 = "nghttp2 — `brew install nghttp2` on macOS, Debian's libnghttp2-dev, Arch's libnghttp2"
+  }
+}

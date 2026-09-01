@@ -1,0 +1,427 @@
+// nghttp2, declared verbatim.
+//
+// **Nothing here is meant to be called by a program.** Every name and every convention is C's: a
+// session is a pointer the library allocated, a failure is a negative integer, a header field is a
+// pair of pointers and lengths, and a frame is a union whose live arm is decided by a byte inside
+// it. The module above turns those into sysl and is what an application imports.
+//
+// **There is no shim, and the survey said there would not need to be one.** Every name below is a
+// real symbol -- `nm -gU libnghttp2.dylib` lists 181 of them and nothing in this file is missing
+// from that list -- the constants are `enum`s rather than macros, which a `c const` block reads
+// either way, and **nothing crosses by value**: every struct nghttp2 hands a callback or takes from
+// one arrives through a pointer. That last fact is what makes the callbacks below ordinary sysl
+// functions whose address is taken with `&f`, rather than `@export`ed ones.
+//
+// **The `2` variants are the ones bound.** `nghttp2_session_mem_send`, `_mem_recv`,
+// `submit_response` and their siblings are deprecated in favour of forms taking `nghttp2_ssize`
+// rather than `ssize_t`; the older names still exist and are deliberately absent here.
+//
+// **This is a partial binding and says so.** nghttp2's surface is the whole of HTTP/2 including
+// server push, extension frames, RFC 9218 priorities and its own priority tree; what is here is the
+// session tier a server and a client need plus the HPACK tier on its own. Adding to it is ordinary
+// -- the rule is only that what is here is faithful, not that it is complete.
+
+module sh.sysl.nghttp2.c
+@link("nghttp2")
+
+@include("nghttp2/nghttp2.h")
+
+// ## The handles
+//
+// Each of these is a struct nghttp2 allocates and hands back through an out-parameter. `opaque
+// struct` is that claim, and it is what stops a session being passed where a deflater is wanted.
+//
+// **Ownership is the caller's and the layer above frees each one exactly once**, which is the same
+// arrangement `sh.sysl.openssl` and `sh.sysl.sqlite3` bind. Nothing here lives in caller storage the
+// way a `sh.sysl.miniz` compressor does; nghttp2 offers no API that would allow it.
+
+opaque struct Session
+opaque struct Callbacks
+opaque struct Options
+opaque struct HdDeflater
+opaque struct HdInflater
+
+/** `nghttp2_frame` -- the union a callback is handed.
+ *
+ * **Opaque on purpose, because a union is one of the three shapes sysl cannot spell.** What makes it
+ * workable without a shim is that every arm begins with a `nghttp2_frame_hd`, so the header is
+ * readable from the union's own address and `hd.ty` says which arm is live. `ptr_cast` to that arm
+ * is then what nghttp2's own examples write as `frame->goaway`.
+ */
+opaque struct Frame
+
+// ## The structs that cross the boundary
+//
+// Every one of these is declared field for field rather than left opaque, because the layer above
+// either writes it or reads it and nghttp2 supplies no accessor for any of the fields. That is safe
+// only while sysl's layout and C's agree, so `c/tests.sysl` asserts every size and the offsets that
+// would move if nghttp2 reordered anything.
+
+/** `nghttp2_nv` -- one header field, as two pointers, two lengths and a flag byte.
+ *
+ * **The pointers are borrowed in both directions and the ownership rule differs by direction.**
+ * Going in, nghttp2 copies the bytes unless `NO_COPY_NAME`/`NO_COPY_VALUE` say otherwise, so a
+ * caller's storage need only outlive the submit call. Coming out of a callback, the bytes belong to
+ * nghttp2 and are valid until the callback returns -- which is why the layer above copies them into
+ * a `string` there and then.
+ */
+struct Nv
+    name: *u8
+    value: *u8
+    namelen: usize
+    valuelen: usize
+    flags: u8
+end Nv
+
+/** `nghttp2_frame_hd` -- the nine bytes on the wire, unpacked.
+ *
+ * `type` is a keyword in sysl, so the field is `ty`. The *layout* is what matters and the name is
+ * this file's to choose; `c/tests.sysl` asserts the offset against `offsetof(nghttp2_frame_hd, type)`
+ * so that the renaming cannot drift into a wrong read.
+ */
+struct FrameHd
+    length: usize
+    stream_id: i32
+    ty: u8
+    flags: u8
+    reserved: u8
+end FrameHd
+
+/** `nghttp2_priority_spec` -- RFC 7540 priorities, which RFC 9113 deprecates.
+ *
+ * Bound because `nghttp2_submit_request2` takes one, and taken as a null pointer everywhere in the
+ * layer above. It is here so that the signature is honest rather than because anything should use
+ * it.
+ */
+struct PrioritySpec
+    stream_id: i32
+    weight: i32
+    exclusive: u8
+end PrioritySpec
+
+/** `nghttp2_settings_entry` -- one SETTINGS parameter. */
+struct SettingsEntry
+    settings_id: i32
+    value: u32
+end SettingsEntry
+
+/** `nghttp2_data_provider2` -- where a DATA frame's bytes come from.
+ *
+ * **`source` is a union of an `int fd` and a `void *ptr` and is bound as the pointer**, which is the
+ * wider of the two arms on every target sysl has. The layer above puts nothing in it: the read
+ * callback finds its way home from the session's user data, which it is handed anyway.
+ */
+struct DataProvider
+    source: *u8
+    read: *extern(*Session, i32, *u8, usize, *u32, *u8, *u8) -> isize
+end DataProvider
+
+// ## The frame union
+//
+// `nghttp2_frame` is a union whose arms all begin with a `nghttp2_frame_hd`, so `hd.ty` is readable
+// from any of them and says which arm is live. The layer above reads the header, then `ptr_cast`s
+// the same pointer to the arm it names -- which is exactly what the C in nghttp2's own examples
+// does, spelled `frame->goaway` instead.
+//
+// **Only the arms something is read out of are declared.** PUSH_PROMISE, PRIORITY and the extension
+// frame are absent because nothing above reads them; adding one is a struct and a test.
+
+/** `nghttp2_headers`. `cat` is the category -- request, response, push response or trailer. */
+struct HeadersFrame
+    hd: FrameHd
+    padlen: usize
+    pri_spec: PrioritySpec
+    nva: *Nv
+    nvlen: usize
+    cat: i32
+end HeadersFrame
+
+/** `nghttp2_rst_stream`. */
+struct RstStreamFrame
+    hd: FrameHd
+    error_code: u32
+end RstStreamFrame
+
+/** `nghttp2_settings`. */
+struct SettingsFrame
+    hd: FrameHd
+    niv: usize
+    iv: *SettingsEntry
+end SettingsFrame
+
+/** `nghttp2_goaway`. */
+struct GoawayFrame
+    hd: FrameHd
+    last_stream_id: i32
+    error_code: u32
+    opaque_data: *u8
+    opaque_data_len: usize
+    reserved: u8
+end GoawayFrame
+
+/** `nghttp2_window_update`. */
+struct WindowUpdateFrame
+    hd: FrameHd
+    window_size_increment: i32
+    reserved: u8
+end WindowUpdateFrame
+
+/** `nghttp2_ping`. The opaque data is eight bytes, and is the whole of what a PING carries. */
+struct PingFrame
+    hd: FrameHd
+    opaque_data: [8]u8
+end PingFrame
+
+// ## The session
+//
+// **`nghttp2_session_client_new` and `_server_new` are the three-argument forms.** The `2` and `3`
+// suffixed ones take an option struct and a custom allocator; neither is wanted here, and a caller
+// that grows a use for options gets them as a fourth declaration rather than as a null everybody
+// passes.
+
+extern "nghttp2_session_client_new" session_client_new(out: **Session, cbs: *Callbacks,
+    user_data: *u8) -> i32
+extern "nghttp2_session_server_new" session_server_new(out: **Session, cbs: *Callbacks,
+    user_data: *u8) -> i32
+extern "nghttp2_session_del" session_del(s: *Session)
+
+extern "nghttp2_session_set_user_data" session_set_user_data(s: *Session, user_data: *u8)
+extern "nghttp2_session_check_server_session" session_check_server_session(s: *Session) -> i32
+
+// **The two calls that move bytes, and neither of them touches a socket.** `mem_send2` writes a
+// pointer to nghttp2's own outgoing buffer into `out` and answers its length; the bytes are valid
+// until the next call on the session. `mem_recv2` takes what arrived and answers how much of it it
+// consumed, which is everything unless a callback asked for a pause.
+extern "nghttp2_session_mem_send2" session_mem_send2(s: *Session, out: **u8) -> isize
+extern "nghttp2_session_mem_recv2" session_mem_recv2(s: *Session, data: *u8, len: usize) -> isize
+
+extern "nghttp2_session_want_read" session_want_read(s: *Session) -> i32
+extern "nghttp2_session_want_write" session_want_write(s: *Session) -> i32
+
+extern "nghttp2_session_terminate_session" session_terminate_session(s: *Session,
+    error_code: u32) -> i32
+
+// The flow-control accessors. `consume` is what tells nghttp2 the application has finished with
+// bytes it was handed, which is how a window gets extended when auto window update is off; the
+// getters are what a test asserts against.
+extern "nghttp2_session_consume" session_consume(s: *Session, stream_id: i32, size: usize) -> i32
+extern "nghttp2_session_get_local_window_size" session_get_local_window_size(s: *Session) -> i32
+extern "nghttp2_session_get_remote_window_size" session_get_remote_window_size(s: *Session) -> i32
+extern "nghttp2_session_get_stream_remote_window_size" session_get_stream_remote_window_size(s: *Session, stream_id: i32) -> i32
+extern "nghttp2_session_get_stream_effective_local_window_size" session_get_stream_effective_local_window_size(s: *Session, stream_id: i32) -> i32
+extern "nghttp2_session_set_local_window_size" session_set_local_window_size(s: *Session,
+    flags: u8, stream_id: i32, window_size: i32) -> i32
+
+extern "nghttp2_session_get_remote_settings" session_get_remote_settings(s: *Session,
+    id: i32) -> u32
+extern "nghttp2_session_get_last_proc_stream_id" session_get_last_proc_stream_id(s: *Session) -> i32
+extern "nghttp2_session_get_outbound_queue_size" session_get_outbound_queue_size(s: *Session) -> usize
+
+// ## The callback table
+//
+// A `Callbacks` is built, filled in one setter at a time and handed to `session_new`, which **copies
+// it** -- so the layer above frees it as soon as the session exists rather than keeping it beside
+// one.
+//
+// Each setter takes a function pointer whose signature is nghttp2's. None of them carries an
+// aggregate by value, which is why `&f` on an ordinary sysl function is an address nghttp2 can call.
+
+extern "nghttp2_session_callbacks_new" callbacks_new(out: **Callbacks) -> i32
+extern "nghttp2_session_callbacks_del" callbacks_del(cbs: *Callbacks)
+
+extern "nghttp2_session_callbacks_set_on_frame_recv_callback" callbacks_set_on_frame_recv(cbs: *Callbacks,
+        f: *extern(*Session, *Frame, *u8) -> i32)
+
+extern "nghttp2_session_callbacks_set_on_data_chunk_recv_callback" callbacks_set_on_data_chunk_recv(cbs: *Callbacks,
+        f: *extern(*Session, u8, i32, *u8, usize, *u8) -> i32)
+
+extern "nghttp2_session_callbacks_set_on_stream_close_callback" callbacks_set_on_stream_close(cbs: *Callbacks,
+        f: *extern(*Session, i32, u32, *u8) -> i32)
+
+extern "nghttp2_session_callbacks_set_on_header_callback" callbacks_set_on_header(cbs: *Callbacks,
+        f: *extern(*Session, *Frame, *u8, usize, *u8, usize, u8, *u8) -> i32)
+
+extern "nghttp2_session_callbacks_set_on_begin_headers_callback" callbacks_set_on_begin_headers(cbs: *Callbacks,
+        f: *extern(*Session, *Frame, *u8) -> i32)
+
+// ## Submitting frames
+//
+// Every one of these queues a frame; nothing is written until `mem_send2` is called. `submit_request2`
+// and `submit_response2` answer a stream id and a status respectively, which is the one asymmetry
+// worth knowing: a request opens a stream, and a response is sent on one that is already open.
+
+extern "nghttp2_submit_request2" submit_request2(s: *Session, pri: *PrioritySpec, nva: *Nv,
+    nvlen: usize, data: *DataProvider, stream_user_data: *u8) -> i32
+extern "nghttp2_submit_response2" submit_response2(s: *Session, stream_id: i32, nva: *Nv,
+    nvlen: usize, data: *DataProvider) -> i32
+extern "nghttp2_submit_trailer" submit_trailer(s: *Session, stream_id: i32, nva: *Nv,
+    nvlen: usize) -> i32
+extern "nghttp2_submit_settings" submit_settings(s: *Session, flags: u8, iv: *SettingsEntry,
+    niv: usize) -> i32
+extern "nghttp2_submit_goaway" submit_goaway(s: *Session, flags: u8, last_stream_id: i32,
+    error_code: u32, debug: *u8, debug_len: usize) -> i32
+extern "nghttp2_submit_rst_stream" submit_rst_stream(s: *Session, flags: u8, stream_id: i32,
+    error_code: u32) -> i32
+extern "nghttp2_submit_window_update" submit_window_update(s: *Session, flags: u8, stream_id: i32,
+    increment: i32) -> i32
+extern "nghttp2_submit_ping" submit_ping(s: *Session, flags: u8, opaque_data: *u8) -> i32
+
+// ## HPACK, on its own
+//
+// The header compression tier is usable without a session at all, which is why the layer above
+// exposes it separately: it is the fiddly, security-relevant half of HTTP/2 and it is identical
+// whoever drives the frames.
+
+extern "nghttp2_hd_deflate_new" hd_deflate_new(out: **HdDeflater, max_table: usize) -> i32
+extern "nghttp2_hd_deflate_del" hd_deflate_del(d: *HdDeflater)
+extern "nghttp2_hd_deflate_bound" hd_deflate_bound(d: *HdDeflater, nva: *Nv, nvlen: usize) -> usize
+extern "nghttp2_hd_deflate_hd2" hd_deflate_hd2(d: *HdDeflater, out: *u8, outlen: usize, nva: *Nv,
+    nvlen: usize) -> isize
+extern "nghttp2_hd_deflate_change_table_size" hd_deflate_change_table_size(d: *HdDeflater,
+    size: usize) -> i32
+
+extern "nghttp2_hd_inflate_new" hd_inflate_new(out: **HdInflater) -> i32
+extern "nghttp2_hd_inflate_del" hd_inflate_del(i: *HdInflater)
+extern "nghttp2_hd_inflate_hd3" hd_inflate_hd3(i: *HdInflater, nv_out: *Nv, flags: *i32,
+    data: *u8, len: usize, final: i32) -> isize
+extern "nghttp2_hd_inflate_end_headers" hd_inflate_end_headers(i: *HdInflater) -> i32
+extern "nghttp2_hd_inflate_change_table_size" hd_inflate_change_table_size(i: *HdInflater,
+    size: usize) -> i32
+
+// ## The odds and ends
+//
+// `check_header_name` and `check_header_value` are nghttp2's own validators, exposed because a
+// program building headers by hand wants the same answer the library will give rather than a second
+// opinion. `select_alpn` picks `h2` out of a wire-format protocol list, which is the one place this
+// package and a TLS binding meet.
+
+extern "nghttp2_strerror" strerror(code: i32) -> *u8
+extern "nghttp2_http2_strerror" http2_strerror(code: u32) -> *u8
+extern "nghttp2_is_fatal" is_fatal(code: i32) -> i32
+extern "nghttp2_check_header_name" check_header_name(name: *u8, len: usize) -> i32
+extern "nghttp2_check_header_value" check_header_value(value: *u8, len: usize) -> i32
+extern "nghttp2_select_alpn" select_alpn(out: **u8, outlen: *u8, offered: *u8, offered_len: u32) -> i32
+
+// ## What the C compiler is asked
+//
+// **The sizes and offsets come from the header rather than from a reading of the structs**, so a
+// new nghttp2 that reorders a frame arm is caught by a failing test rather than by a wrong read at
+// run time. Every struct declared above is checked, and so is every field the layer above touches
+// by name.
+
+c const
+    NV_SIZE:            usize = "sizeof(nghttp2_nv)"
+    FRAME_HD_SIZE:      usize = "sizeof(nghttp2_frame_hd)"
+    PRIORITY_SPEC_SIZE: usize = "sizeof(nghttp2_priority_spec)"
+    SETTINGS_ENTRY_SIZE: usize = "sizeof(nghttp2_settings_entry)"
+    DATA_PROVIDER_SIZE: usize = "sizeof(nghttp2_data_provider2)"
+    HEADERS_SIZE:       usize = "sizeof(nghttp2_headers)"
+    RST_STREAM_SIZE:    usize = "sizeof(nghttp2_rst_stream)"
+    SETTINGS_SIZE:      usize = "sizeof(nghttp2_settings)"
+    GOAWAY_SIZE:        usize = "sizeof(nghttp2_goaway)"
+    WINDOW_UPDATE_SIZE: usize = "sizeof(nghttp2_window_update)"
+    PING_SIZE:          usize = "sizeof(nghttp2_ping)"
+
+c const
+    HD_TYPE_OFFSET:      usize = "offsetof(nghttp2_frame_hd, type)"
+    HD_FLAGS_OFFSET:     usize = "offsetof(nghttp2_frame_hd, flags)"
+    HD_STREAM_ID_OFFSET: usize = "offsetof(nghttp2_frame_hd, stream_id)"
+
+    HEADERS_NVA_OFFSET:   usize = "offsetof(nghttp2_headers, nva)"
+    HEADERS_CAT_OFFSET:   usize = "offsetof(nghttp2_headers, cat)"
+    GOAWAY_ERROR_OFFSET:  usize = "offsetof(nghttp2_goaway, error_code)"
+    GOAWAY_LAST_OFFSET:   usize = "offsetof(nghttp2_goaway, last_stream_id)"
+    WINDOW_INCR_OFFSET:   usize = "offsetof(nghttp2_window_update, window_size_increment)"
+    SETTINGS_IV_OFFSET:   usize = "offsetof(nghttp2_settings, iv)"
+    RST_ERROR_OFFSET:     usize = "offsetof(nghttp2_rst_stream, error_code)"
+    PING_DATA_OFFSET:     usize = "offsetof(nghttp2_ping, opaque_data)"
+
+// `nghttp2_frame_type`.
+c const
+    FRAME_DATA:          u8 = "NGHTTP2_DATA"
+    FRAME_HEADERS:       u8 = "NGHTTP2_HEADERS"
+    FRAME_PRIORITY:      u8 = "NGHTTP2_PRIORITY"
+    FRAME_RST_STREAM:    u8 = "NGHTTP2_RST_STREAM"
+    FRAME_SETTINGS:      u8 = "NGHTTP2_SETTINGS"
+    FRAME_PUSH_PROMISE:  u8 = "NGHTTP2_PUSH_PROMISE"
+    FRAME_PING:          u8 = "NGHTTP2_PING"
+    FRAME_GOAWAY:        u8 = "NGHTTP2_GOAWAY"
+    FRAME_WINDOW_UPDATE: u8 = "NGHTTP2_WINDOW_UPDATE"
+    FRAME_CONTINUATION:  u8 = "NGHTTP2_CONTINUATION"
+
+// `nghttp2_flag`. **`ACK` and `END_STREAM` are the same bit**, read against different frame types --
+// which is the wire format's doing rather than this file's.
+c const
+    FLAG_NONE:        u8 = "NGHTTP2_FLAG_NONE"
+    FLAG_END_STREAM:  u8 = "NGHTTP2_FLAG_END_STREAM"
+    FLAG_END_HEADERS: u8 = "NGHTTP2_FLAG_END_HEADERS"
+    FLAG_ACK:         u8 = "NGHTTP2_FLAG_ACK"
+    FLAG_PADDED:      u8 = "NGHTTP2_FLAG_PADDED"
+    FLAG_PRIORITY:    u8 = "NGHTTP2_FLAG_PRIORITY"
+
+// `nghttp2_settings_id`.
+c const
+    SETTINGS_HEADER_TABLE_SIZE:      i32 = "NGHTTP2_SETTINGS_HEADER_TABLE_SIZE"
+    SETTINGS_ENABLE_PUSH:            i32 = "NGHTTP2_SETTINGS_ENABLE_PUSH"
+    SETTINGS_MAX_CONCURRENT_STREAMS: i32 = "NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS"
+    SETTINGS_INITIAL_WINDOW_SIZE:    i32 = "NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE"
+    SETTINGS_MAX_FRAME_SIZE:         i32 = "NGHTTP2_SETTINGS_MAX_FRAME_SIZE"
+    SETTINGS_MAX_HEADER_LIST_SIZE:   i32 = "NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE"
+
+// `nghttp2_error_code` -- the codes that travel on the wire in a RST_STREAM or a GOAWAY. These are
+// HTTP/2's, and are a different set from the library's own negative errors below.
+c const
+    NO_ERROR:            u32 = "NGHTTP2_NO_ERROR"
+    PROTOCOL_ERROR:      u32 = "NGHTTP2_PROTOCOL_ERROR"
+    INTERNAL_ERROR:      u32 = "NGHTTP2_INTERNAL_ERROR"
+    FLOW_CONTROL_ERROR:  u32 = "NGHTTP2_FLOW_CONTROL_ERROR"
+    SETTINGS_TIMEOUT:    u32 = "NGHTTP2_SETTINGS_TIMEOUT"
+    STREAM_CLOSED:       u32 = "NGHTTP2_STREAM_CLOSED"
+    FRAME_SIZE_ERROR:    u32 = "NGHTTP2_FRAME_SIZE_ERROR"
+    REFUSED_STREAM:      u32 = "NGHTTP2_REFUSED_STREAM"
+    CANCEL:              u32 = "NGHTTP2_CANCEL"
+    COMPRESSION_ERROR:   u32 = "NGHTTP2_COMPRESSION_ERROR"
+    CONNECT_ERROR:       u32 = "NGHTTP2_CONNECT_ERROR"
+    ENHANCE_YOUR_CALM:   u32 = "NGHTTP2_ENHANCE_YOUR_CALM"
+    INADEQUATE_SECURITY: u32 = "NGHTTP2_INADEQUATE_SECURITY"
+    HTTP_1_1_REQUIRED:   u32 = "NGHTTP2_HTTP_1_1_REQUIRED"
+
+// `nghttp2_error` -- the library's own, all negative. Only the ones something here can act on
+// differently are named; the rest arrive as a number with `strerror` beside it.
+c const
+    ERR_INVALID_ARGUMENT:   i32 = "NGHTTP2_ERR_INVALID_ARGUMENT"
+    ERR_NOMEM:              i32 = "NGHTTP2_ERR_NOMEM"
+    ERR_CALLBACK_FAILURE:   i32 = "NGHTTP2_ERR_CALLBACK_FAILURE"
+    ERR_DEFERRED:           i32 = "NGHTTP2_ERR_DEFERRED"
+    ERR_PAUSE:              i32 = "NGHTTP2_ERR_PAUSE"
+    ERR_TEMPORAL_CALLBACK_FAILURE: i32 = "NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE"
+    ERR_HEADER_COMP:        i32 = "NGHTTP2_ERR_HEADER_COMP"
+    ERR_BUFFER_ERROR:       i32 = "NGHTTP2_ERR_BUFFER_ERROR"
+    ERR_INSUFF_BUFSIZE:     i32 = "NGHTTP2_ERR_INSUFF_BUFSIZE"
+    ERR_STREAM_CLOSED:      i32 = "NGHTTP2_ERR_STREAM_CLOSED"
+    ERR_EOF:                i32 = "NGHTTP2_ERR_EOF"
+
+// `nghttp2_nv_flag`, `nghttp2_headers_category`, `nghttp2_data_flag` and the HPACK inflater's
+// output flags.
+c const
+    NV_FLAG_NONE:     u8 = "NGHTTP2_NV_FLAG_NONE"
+    NV_FLAG_NO_INDEX: u8 = "NGHTTP2_NV_FLAG_NO_INDEX"
+
+    HCAT_REQUEST:       i32 = "NGHTTP2_HCAT_REQUEST"
+    HCAT_RESPONSE:      i32 = "NGHTTP2_HCAT_RESPONSE"
+    HCAT_PUSH_RESPONSE: i32 = "NGHTTP2_HCAT_PUSH_RESPONSE"
+    HCAT_HEADERS:       i32 = "NGHTTP2_HCAT_HEADERS"
+
+    DATA_FLAG_NONE:          u32 = "NGHTTP2_DATA_FLAG_NONE"
+    DATA_FLAG_EOF:           u32 = "NGHTTP2_DATA_FLAG_EOF"
+    DATA_FLAG_NO_END_STREAM: u32 = "NGHTTP2_DATA_FLAG_NO_END_STREAM"
+
+    HD_INFLATE_NONE:  i32 = "NGHTTP2_HD_INFLATE_NONE"
+    HD_INFLATE_FINAL: i32 = "NGHTTP2_HD_INFLATE_FINAL"
+    HD_INFLATE_EMIT:  i32 = "NGHTTP2_HD_INFLATE_EMIT"
+
+// The connection preface a client sends before anything else. nghttp2 writes it itself as the first
+// thing out of a client session, so nothing here submits it; it is named because a test asserting
+// what the first bytes on the wire are needs to say what it expects.
+c const
+    CLIENT_MAGIC_LEN: usize = "NGHTTP2_CLIENT_MAGIC_LEN"
