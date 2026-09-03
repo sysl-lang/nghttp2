@@ -174,15 +174,29 @@ end PingFrame
 
 // ## The session
 //
-// **`nghttp2_session_client_new` and `_server_new` are the three-argument forms.** The `2` and `3`
-// suffixed ones take an option struct and a custom allocator; neither is wanted here, and a caller
-// that grows a use for options gets them as a fourth declaration rather than as a null everybody
-// passes.
+// **`nghttp2_session_client_new` and `_server_new` are the three-argument forms, and the `2` forms
+// are here beside them because ONE option turned out to be load-bearing.** The `3` suffixed pair
+// takes a custom allocator as well, which is not wanted; the option struct is, because
+// `nghttp2_session_consume` answers `INVALID_STATE` unless automatic window updates are off -- so a
+// caller that wants to say when a body has been dealt with cannot do it without this.
+
+extern "nghttp2_option_new" option_new(out: **Options) -> i32
+extern "nghttp2_option_del" option_del(o: *Options)
+
+// **Off means THIS end sends the WINDOW_UPDATE itself**, with `session_consume`, which is what a
+// program does when it wants back-pressure: credit is returned when the bytes have actually been
+// dealt with rather than when they arrived.
+extern "nghttp2_option_set_no_auto_window_update" option_set_no_auto_window_update(o: *Options,
+    on: i32)
 
 extern "nghttp2_session_client_new" session_client_new(out: **Session, cbs: *Callbacks,
     user_data: *u8) -> i32
 extern "nghttp2_session_server_new" session_server_new(out: **Session, cbs: *Callbacks,
     user_data: *u8) -> i32
+extern "nghttp2_session_client_new2" session_client_new2(out: **Session, cbs: *Callbacks,
+    user_data: *u8, o: *Options) -> i32
+extern "nghttp2_session_server_new2" session_server_new2(out: **Session, cbs: *Callbacks,
+    user_data: *u8, o: *Options) -> i32
 extern "nghttp2_session_del" session_del(s: *Session)
 
 extern "nghttp2_session_set_user_data" session_set_user_data(s: *Session, user_data: *u8)
@@ -400,6 +414,10 @@ c const
     ERR_INSUFF_BUFSIZE:     i32 = "NGHTTP2_ERR_INSUFF_BUFSIZE"
     ERR_STREAM_CLOSED:      i32 = "NGHTTP2_ERR_STREAM_CLOSED"
     ERR_EOF:                i32 = "NGHTTP2_ERR_EOF"
+
+    // **What `nghttp2_session_consume` answers when the session extends its own windows**, which is
+    // named here so the layer above can say what to do about it rather than passing on two words.
+    ERR_INVALID_STATE:      i32 = "NGHTTP2_ERR_INVALID_STATE"
 
 // `nghttp2_nv_flag`, `nghttp2_headers_category`, `nghttp2_data_flag` and the HPACK inflater's
 // output flags.

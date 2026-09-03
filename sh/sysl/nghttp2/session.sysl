@@ -148,6 +148,12 @@ struct Session
 
     private bodies: Buf[Body]
 
+    // Whether nghttp2 extends this end's windows by itself, which is what a session made without
+    // options does. **`consume` is only legal when it does not**, and nghttp2 answers `INVALID_STATE`
+    // for that -- a sentence that sends a reader looking at the stream rather than at how the session
+    // was made, so the check is here and the sentence is this file's.
+    private auto_window: bool
+
     /** Whether this end is the server. */
     is_server(self) -> bool = c.session_check_server_session(self.s) != 0
 
@@ -337,10 +343,16 @@ struct Session
 
     /** Tell the session bytes it handed over have been dealt with, so the window may be extended.
      *
-     * Only needed where automatic window updates have been turned off; a default session extends
-     * its own windows.
+     * **This is the back-pressure half of flow control and it needs a session that was made for it.**
+     * A default session extends its own windows as bytes ARRIVE, which is right for a program that
+     * deals with a body as fast as it reads one; a program that queues bodies, writes them to disk or
+     * hands them to something slower wants the credit returned when the work is done instead, and
+     * that is `client_with(no_auto_window_update())`.
      */
     consume(*self, stream: i32, size: usize) -> Result[unit, Error]
+        if self.auto_window
+            return Err(Error(c.ERR_INVALID_STATE, "this session extends its own windows, so there is nothing to report -- make it with `client_with(no_auto_window_update())` to take that over"))
+
         val r = c.session_consume(self.s, stream, size)
 
         if r != 0 then Err(failing(r, "reporting consumed bytes")) else Ok(())
@@ -542,7 +554,25 @@ end pull
 
 // -- making one ---------------------------------------------------------------------------------
 
-private make(server: bool) -> Result[&Session, Error]
+/** How a session is set up, where nghttp2's defaults are not what a caller wants. */
+struct Options
+    // Whether nghttp2 extends this end's flow-control windows as bytes arrive.
+    auto_window_update: bool
+end Options
+
+/** nghttp2's own defaults. */
+options() -> Options = Options(true)
+
+/** Take flow control over: this end sends its own WINDOW_UPDATEs, with `consume`.
+ *
+ * **What it buys is back-pressure.** A default session gives the peer credit the moment bytes
+ * arrive, so a program that queues bodies faster than it deals with them keeps the peer sending; one
+ * that returns credit when the work is DONE makes the peer wait, which is what a proxy, an uploader
+ * and anything writing to disk want.
+ */
+no_auto_window_update() -> Options = Options(false)
+
+private make(server: bool, o: Options) -> Result[&Session, Error]
     var cbs: *c.Callbacks = ptr_cast(0usize)
 
     val made = c.callbacks_new(&cbs)
@@ -559,10 +589,32 @@ private make(server: bool) -> Result[&Session, Error]
 
     var opened: i32 = 0
 
+    // **The option struct is nghttp2's own and is freed here**, the session having copied what it
+    // needed out of it -- which is the arrangement the callback table above already has.
+    var opt: *c.Options = ptr_cast(0usize)
+
+    if !o.auto_window_update
+        val room = c.option_new(&opt)
+
+        if room != 0
+            c.callbacks_del(cbs)
+
+            return Err(failing(room, "making a session's options"))
+
+        c.option_set_no_auto_window_update(opt, 1)
+
     if server
-        opened = c.session_server_new(&s, cbs, ptr_cast(0usize))
+        if o.auto_window_update
+            opened = c.session_server_new(&s, cbs, ptr_cast(0usize))
+        else
+            opened = c.session_server_new2(&s, cbs, ptr_cast(0usize), opt)
     else
-        opened = c.session_client_new(&s, cbs, ptr_cast(0usize))
+        if o.auto_window_update
+            opened = c.session_client_new(&s, cbs, ptr_cast(0usize))
+        else
+            opened = c.session_client_new2(&s, cbs, ptr_cast(0usize), opt)
+
+    if !o.auto_window_update then c.option_del(opt)
 
     // **Freed immediately, because nghttp2 copies the table into the session.** Keeping it beside
     // the session would be a second thing to free and nothing would ever read it.
@@ -570,7 +622,7 @@ private make(server: bool) -> Result[&Session, Error]
 
     if opened != 0 then return Err(failing(opened, "making a session"))
 
-    val box: &Session = Session(s, buf(), 0, buf(), buf())
+    val box: &Session = Session(s, buf(), 0, buf(), buf(), o.auto_window_update)
 
     // **The box's own address, which is what every callback above is handed.** A `&T` does not
     // move, so this stays true for as long as the session does -- and the session cannot outlive
@@ -588,7 +640,18 @@ private make(server: bool) -> Result[&Session, Error]
 end make
 
 /** A client session. Its first bytes out are the connection preface and an empty SETTINGS. */
-client() -> Result[&Session, Error] = make(false)
+client() -> Result[&Session, Error] = make(false, options())
 
 /** A server session. */
-server() -> Result[&Session, Error] = make(true)
+server() -> Result[&Session, Error] = make(true, options())
+
+/** The same, said differently: a session made with something other than nghttp2's defaults.
+ *
+ * **There is one option here and it is here because `consume` cannot work without it.** nghttp2 has
+ * a dozen; the rest are tuning a caller has not asked for, and a struct that grew a field per
+ * setting would be a second copy of nghttp2's own documentation. Add the next one when something
+ * needs it, which is how this one arrived.
+ */
+client_with(o: Options) -> Result[&Session, Error] = make(false, o)
+
+server_with(o: Options) -> Result[&Session, Error] = make(true, o)

@@ -10,7 +10,7 @@ module sh.sysl.nghttp2
 // needs a port, and no order of events that depends on the kernel.
 
 import sysl.buf.{Buf, buf}
-import sysl.text.from_utf8_unchecked
+import sysl.text.{from_utf8_unchecked, Search}
 
 // Both ends of a connection, and the wire between them.
 private struct Pair
@@ -427,3 +427,49 @@ http_one_is_not_http_two()
             assert(e.code < 0)
             assert(e.fatal())
 end http_one_is_not_http_two
+
+// **`consume` needs a session that was made to want it, and the refusal says so.** nghttp2's own
+// answer is `INVALID_STATE`, which sends a reader to look at the stream; what is wrong is how the
+// session was made, and that is two words the caller cannot act on against one sentence they can.
+@test("reporting consumed bytes needs a session that does not extend its own windows")
+consume_needs_the_option()
+    var sv = server().unwrap()
+
+    sv.consume(1, 10) match
+        Ok(_) -> assert(false)
+        Err(e) ->
+            assert(e.code < 0)
+            assert(e.message.contains("no_auto_window_update"))
+end consume_needs_the_option
+
+// **With the option, this end takes flow control over: no credit is returned until it says so.**
+// That is the back-pressure a proxy, an uploader and anything writing to disk wants -- the peer
+// waits while the work is done rather than while the bytes are merely held.
+@test("a session that does not auto-update its window returns credit when told")
+consume_returns_credit()
+    var cl = client_with(no_auto_window_update()).unwrap()
+    var sv = server_with(no_auto_window_update()).unwrap()
+
+    var p = Pair(cl, sv)
+
+    var big: Buf[u8] = buf()
+
+    for i in 0..<40000
+        big.push(u8(65))
+
+    p.client.request(get("/up"), Some(big.view())).unwrap()
+    p.flush()
+    drain(p.server)
+
+    // **Nothing has been given back**, where a default session would have extended the window as
+    // the bytes arrived.
+    val held = p.client.remote_window()
+
+    assert(held < 40000)
+
+    // And now it is, because the server said the bytes had been dealt with.
+    p.server.consume(1, 40000).unwrap()
+    p.flush()
+
+    assert(p.client.remote_window() > held)
+end consume_returns_credit

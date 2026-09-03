@@ -5,7 +5,7 @@
 
 ```
 dependencies {
-  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.1.0" }
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.2.0" }
 }
 ```
 
@@ -118,7 +118,7 @@ conn.alpn() match                           // ... and after it
 | **Sessions** | client and server, the connection preface, SETTINGS |
 | **Streams** | requests, responses, bodies, trailers, multiplexing |
 | **Giving up** | RST_STREAM, GOAWAY, immediate termination |
-| **Flow control** | window sizes at connection and stream, WINDOW_UPDATE, explicit consume |
+| **Flow control** | window sizes at connection and stream, WINDOW_UPDATE, and back-pressure with `no_auto_window_update()` and `consume` |
 | **ALPN** | `h2` selection over a wire-format list |
 
 **A body is buffered rather than streamed.** `request` and `respond` take the bytes they are to
@@ -159,7 +159,7 @@ deletes it.
 sysl test .
 ```
 
-**47 passed, 0 failed.**
+**49 passed, 0 failed.**
 
 The oracle for HPACK is RFC 7541's own Appendix C.4, not nghttp2: three request blocks printed in
 hexadecimal with what each decodes to, and none of those numbers came from this library. The three
