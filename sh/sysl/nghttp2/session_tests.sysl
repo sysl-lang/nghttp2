@@ -473,3 +473,212 @@ consume_returns_credit()
 
     assert(p.client.remote_window() > held)
 end consume_returns_credit
+
+// -- a body written a piece at a time ------------------------------------------------------------
+//
+// **What separates these from the tests above is WHEN the caller knows what it is sending.** A body
+// submitted whole is one a program already has; an event stream, a proxied response and a file being
+// read do not have one, and a protocol binding that could only send the first kind could not carry
+// any of them.
+
+// **The head goes out before a single byte of the body, and that is the whole point.** A response
+// whose source never ends -- which is what an event stream is -- would otherwise never send its
+// `200`, and every browser waiting on one would wait forever.
+@test("a streamed response sends its head before there is any body")
+a_streamed_response_answers_first()
+    var p = pair()
+
+    p.client.request(get("/events")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/event-stream")).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "settings|headers 1 response :status=200,content-type=text/event-stream")
+end a_streamed_response_answers_first
+
+// **One DATA frame per push, arriving as it is written.** A body joined up and sent at the end would
+// pass a test that only looked at the bytes; what an event stream needs is for each piece to reach
+// the peer while the next one is still unwritten.
+@test("each piece of a streamed body arrives as its own DATA frame")
+a_streamed_body_arrives_a_piece_at_a_time()
+    var p = pair()
+
+    p.client.request(get("/events")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/event-stream")).unwrap()
+    p.flush()
+    drain(p.client)
+
+    p.server.push(1, "first".bytes).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "data 1 first")
+
+    p.server.push(1, "second".bytes).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "data 1 second")
+
+    p.server.finish(1).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "end 1|close 1 NO_ERROR")
+end a_streamed_body_arrives_a_piece_at_a_time
+
+// **A stream with nothing pushed yet writes nothing and does not end**, which is what `ERR_DEFERRED`
+// buys: answering zero bytes would send an empty DATA frame and answering EOF would end a stream the
+// caller has not finished writing.
+@test("a streamed body that has nothing yet writes nothing and stays open")
+an_empty_streamed_body_defers()
+    var p = pair()
+
+    p.client.request(get("/events")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/plain")).unwrap()
+    p.flush()
+    drain(p.client)
+
+    // Several rounds with nothing to send, which is a program sitting on an idle event stream.
+    p.flush()
+    p.flush()
+
+    assert_eq(drain(p.client), "")
+
+    p.server.push(1, "late".bytes).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "data 1 late")
+end an_empty_streamed_body_defers
+
+// **Trailers are what a streamed body could not have known when it started**, which is the case they
+// exist for: a checksum, a row count, a failure halfway through something that had already promised
+// a 200.
+@test("a streamed body may end with trailers")
+a_streamed_body_may_carry_trailers()
+    var p = pair()
+
+    p.client.request(get("/rows")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/csv")).unwrap()
+    p.server.push(1, "a,b\n".bytes).unwrap()
+    p.flush()
+    drain(p.client)
+
+    p.server.finish(1, Some([header("x-rows", "1")])).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "headers 1 trailer x-rows=1|end 1|close 1 NO_ERROR")
+end a_streamed_body_may_carry_trailers
+
+// **The request side is the same machinery and it is what an upload of unknown length needs.** It is
+// also the only way a test can produce a partial upload at all -- a body submitted whole is written
+// in one go, so nothing that holds a stream open mid-body could be reached from this end.
+@test("a request body may be written a piece at a time too")
+a_streamed_request_body_arrives_in_pieces()
+    var p = pair()
+
+    val id = p.client.request_stream([header(":method", "POST"), header(":scheme", "https"),
+        header(":path", "/up"), header(":authority", "example.test")]).unwrap()
+
+    p.flush()
+
+    assert_eq(drain(p.server), "settings|headers 1 request :method=POST,:scheme=https,:path=/up," +
+        ":authority=example.test")
+
+    p.client.push(id, "one".bytes).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "data 1 one")
+
+    p.client.push(id, "two".bytes).unwrap()
+    p.client.finish(id).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "data 1 two|end 1")
+end a_streamed_request_body_arrives_in_pieces
+
+// **A body outlives its stream unless the close drops it**, and a long-lived connection that resets
+// streams mid-upload would hold every abandoned body for its whole life. The push afterwards is what
+// makes the drop observable: a caller learns the peer has gone from the answer rather than by
+// writing into nothing.
+@test("a stream reset mid-body drops what was held for it")
+a_reset_stream_gives_up_its_body()
+    var p = pair()
+
+    val id = p.client.request_stream([header(":method", "POST"), header(":scheme", "https"),
+        header(":path", "/up"), header(":authority", "example.test")]).unwrap()
+
+    p.client.push(id, "half of it".bytes).unwrap()
+    p.flush()
+    drain(p.server)
+    drain(p.client)
+
+    p.server.reset(id, CANCEL).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "reset 1 CANCEL|close 1 CANCEL")
+
+    // The stream is gone at both ends, so there is nothing left to write to.
+    p.client.push(id, "the rest".bytes) match
+        Ok(_) -> assert_eq("a push to a reset stream was accepted", "")
+        Err(e) -> assert(e.message.contains("there is no body open on stream 1"))
+end a_reset_stream_gives_up_its_body
+
+@test("a body that has been finished takes nothing more, and one that was never opened takes nothing at all")
+pushing_where_nothing_is_open_says_so()
+    var p = pair()
+
+    p.client.request(get("/x")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/plain")).unwrap()
+    p.server.finish(1).unwrap()
+
+    p.server.push(1, "too late".bytes) match
+        Ok(_) -> assert_eq("a push after finish was accepted", "")
+        Err(e) -> assert(e.message.contains("has been finished"))
+
+    p.server.push(99, "nowhere".bytes) match
+        Ok(_) -> assert_eq("a push to a stream nobody opened was accepted", "")
+        Err(e) -> assert(e.message.contains("there is no body open on stream 99"))
+end pushing_where_nothing_is_open_says_so
+
+// **A long stream must not hold every byte it ever sent.** What nghttp2 has taken is dropped at the
+// next push, so a thousand pieces cost what one of them does rather than all of them -- and the
+// bytes still arrive in order, which is what the assertion below is really checking.
+@test("a long streamed body does not keep what has already gone out")
+a_streamed_body_drops_what_it_has_sent()
+    var p = pair()
+
+    p.client.request(get("/long")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond_stream(1, ok("text/plain")).unwrap()
+    p.flush()
+    drain(p.client)
+
+    var said = ""
+
+    for i in 0..<200
+        p.server.push(1, "x".bytes).unwrap()
+        p.flush()
+
+        said += drain(p.client)
+
+    p.server.finish(1).unwrap()
+    p.flush()
+
+    assert_eq(said.len, 200 * "data 1 x".len)
+    assert(said.starts_with("data 1 x"))
+    assert_eq(drain(p.client), "end 1|close 1 NO_ERROR")
+end a_streamed_body_drops_what_it_has_sent

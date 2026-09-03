@@ -118,12 +118,19 @@ private entry(s: Setting) -> c.SettingsEntry = s match
 // place that moment exists is inside the read callback -- which is exactly where nghttp2's own
 // documentation says to call `nghttp2_submit_trailer`. So a caller names its trailers when it names
 // its body, and this carries them the few microseconds until they can be sent.
+//
+// **`open` is what makes a body a STREAM rather than a message.** A body submitted whole is closed
+// from the start, so running out of bytes is the end of it; a body written a piece at a time is
+// open, so running out means *not yet* -- the read callback answers `ERR_DEFERRED` and nghttp2 stops
+// asking until `push` or `finish` wakes it. That one flag is the whole difference between the two
+// ways of sending a body, and it is why there is no second kind of `Body`.
 private struct Body
     stream: i32
     bytes: Buf[u8]
     sent: usize
     trailers: Buf[Header]
     has_trailers: bool
+    open: bool
 end Body
 
 /** One HTTP/2 connection.
@@ -264,6 +271,138 @@ struct Session
         Ok(())
     end respond
 
+    // -- a body written a piece at a time -------------------------------------------------------
+    //
+    // **The three calls below are what a body nobody has finished writing needs, and they are three
+    // rather than one because HTTP/2 separates the head from the body on the wire.** The headers go
+    // out at once -- which is what lets a browser start rendering, and what makes an event stream
+    // work at all -- and the DATA frames follow whenever there is something to put in them. The
+    // whole-body forms above are the special case where everything is known at the submit.
+
+    /** Open a stream with a request whose body is written afterwards, with `push` and `finish`.
+     *
+     * A client's call, and what an upload of unknown length is. The HEADERS go out on the next
+     * `send`; nothing else does until something is pushed.
+     */
+    request_stream(*self, headers: []const Header) -> Result[i32, Error]
+        var nva = to_nva(headers)
+        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+
+        val id = c.submit_request2(self.s, ptr_cast(0usize), as_ptr(nva.view()), nva.len(), &prd,
+            ptr_cast(0usize))
+
+        if id < 0 then return Err(failing(id, "submitting a request"))
+
+        self.open_body(id)
+
+        Ok(id)
+    end request_stream
+
+    /** Send a response whose body is written afterwards, with `push` and `finish`.
+     *
+     * A server's call, and what an event stream, a proxied body and a file of unknown length all
+     * are. **The response head is sent without waiting for a single byte of the body**, which is the
+     * difference between this and `respond`: a stream that never ends still has to say `200` first.
+     */
+    respond_stream(*self, stream: i32, headers: []const Header) -> Result[unit, Error]
+        var nva = to_nva(headers)
+        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+
+        self.open_body(stream)
+
+        val r = c.submit_response2(self.s, stream, as_ptr(nva.view()), nva.len(), &prd)
+
+        if r != 0 then return Err(failing(r, "submitting a response"))
+
+        Ok(())
+    end respond_stream
+
+    /** Add bytes to a body that is still open. They go out on the next `send`.
+     *
+     * **Answers an error where the stream has no open body**, which is the ordinary way a caller
+     * learns the peer gave up: a reset or a close drops the body, so the next push says so rather
+     * than writing into nothing. That is a condition to handle and not a defect -- the peer going
+     * away is not something this end did wrong.
+     */
+    push(*self, stream: i32, bytes: []const u8) -> Result[unit, Error]
+        var i: usize = 0
+
+        while i < self.bodies.len()
+            var b = self.bodies.at(i)
+
+            if b.stream == stream
+                if !b.open
+                    return Err(Error(c.ERR_INVALID_STATE, s"the body on stream ${stream} has been finished, so there is nothing to add to"))
+
+                // **What nghttp2 has already taken is dropped rather than kept.** A body written a
+                // piece at a time may be a hundred thousand frames long, and a cursor that only
+                // ever moves forward would hold every byte of it for the life of the connection.
+                if b.sent > 0
+                    var left: Buf[u8] = buf()
+
+                    left.extend(b.bytes.view()[b.sent..<b.bytes.len()])
+
+                    b.bytes = left
+                    b.sent = 0
+
+                b.bytes.extend(bytes)
+
+                self.bodies.set(i, b)
+
+                return self.wake(stream)
+
+            i += 1
+
+        Err(Error(c.ERR_INVALID_ARGUMENT, s"there is no body open on stream ${stream}"))
+    end push
+
+    /** The body is complete: what is left goes out and the stream ends after it.
+     *
+     * Trailers may be named here, which is the one place a streamed body can carry them -- what was
+     * unknown until the body finished is exactly what a trailer is for.
+     */
+    finish(*self, stream: i32, trailers: Option[[]const Header] = None) -> Result[unit, Error]
+        var i: usize = 0
+
+        while i < self.bodies.len()
+            var b = self.bodies.at(i)
+
+            if b.stream == stream
+                var tail: Buf[Header] = buf()
+
+                trailers match
+                    Some(ts) -> tail.extend(ts)
+                    None -> ()
+
+                b.trailers = tail
+                b.has_trailers = tail.len() > 0
+                b.open = false
+
+                self.bodies.set(i, b)
+
+                return self.wake(stream)
+
+            i += 1
+
+        Err(Error(c.ERR_INVALID_ARGUMENT, s"there is no body open on stream ${stream}"))
+    end finish
+
+    // Tell nghttp2 to ask this stream's source again.
+    //
+    // **A refusal here is not a failure and is dropped on purpose.** `resume_data` answers
+    // `INVALID_ARGUMENT` both for a stream that does not exist and for one whose source was never
+    // deferred, and the second is the ordinary case: bytes pushed while nghttp2 was still willing to
+    // ask are picked up by the next `send` with nothing to wake. The stream's existence has already
+    // been established by finding its body.
+    private wake(*self, stream: i32) -> Result[unit, Error]
+        val woke = c.session_resume_data(self.s, stream)
+
+        Ok(())
+    end wake
+
+    private open_body(*self, stream: i32)
+        self.bodies.push(Body(stream, buf(), 0, buf(), false, true))
+
     private hold(*self, stream: i32, body: Option[[]const u8], trailers: Option[[]const Header])
         if !sends_data(body, trailers) then return
 
@@ -279,7 +418,7 @@ struct Session
             Some(ts) -> tail.extend(ts)
             None -> ()
 
-        self.bodies.push(Body(stream, held, 0, tail, tail.len() > 0))
+        self.bodies.push(Body(stream, held, 0, tail, tail.len() > 0, false))
     end hold
 
     /** Send SETTINGS. A session sends an empty one when it is made, which is what the protocol
@@ -445,6 +584,21 @@ end on_data_chunk
 private on_stream_close(s: *c.Session, stream: i32, code: u32, user: *u8) -> i32
     var sess = held(user)
 
+    // **A body outlives its stream unless something drops it here.** A peer that resets a stream
+    // halfway through an upload leaves bytes registered for a stream that will never be written
+    // again -- held for the life of the connection, which for a long-lived one is a leak measured
+    // in whatever the peer sent. This is the one moment nghttp2 says the stream is finished at both
+    // ends, whether it ended, was reset, or went with the connection.
+    var i: usize = 0
+
+    while i < sess.bodies.len()
+        if sess.bodies.at(i).stream == stream
+            sess.bodies.remove(i)
+
+            break
+
+        i += 1
+
     sess.events.push(StreamClose(stream, code))
 
     0
@@ -517,13 +671,20 @@ private pull(s: *c.Session, stream: i32, out: *u8, length: usize, data_flags: *u
 
         if b.stream == stream
             val left = b.bytes.len() - b.sent
+
+            // **Nothing yet is not the same as nothing more.** A body still open says so with
+            // `ERR_DEFERRED`, which takes this stream out of the write loop until `resume_data`
+            // puts it back -- where answering zero bytes would be read as an empty DATA frame and
+            // answering EOF would end a stream the caller has not finished writing.
+            if left == 0 && b.open then return isize(c.ERR_DEFERRED)
+
             val n = if left < length then left else length
 
             if n > 0 then copy(out[0..<n], b.bytes.view()[b.sent..<(b.sent + n)])
 
             b.sent += n
 
-            if b.sent == b.bytes.len()
+            if b.sent == b.bytes.len() && !b.open
                 // **Trailers are submitted from in here, which is the only moment they are legal.**
                 // `NO_END_STREAM` beside `EOF` says the body is finished but the stream is not, so
                 // there is somewhere for a header block to go; without it nghttp2 closes the stream

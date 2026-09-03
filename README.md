@@ -5,7 +5,7 @@
 
 ```
 dependencies {
-  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.2.0" }
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.0" }
 }
 ```
 
@@ -117,14 +117,40 @@ conn.alpn() match                           // ... and after it
 | **HPACK** | encode, decode, dynamic table resizing, never-indexed fields |
 | **Sessions** | client and server, the connection preface, SETTINGS |
 | **Streams** | requests, responses, bodies, trailers, multiplexing |
+| **Streamed bodies** | `respond_stream`, `request_stream`, `push` and `finish` — a body written as it is produced |
 | **Giving up** | RST_STREAM, GOAWAY, immediate termination |
 | **Flow control** | window sizes at connection and stream, WINDOW_UPDATE, and back-pressure with `no_auto_window_update()` and `consume` |
 | **ALPN** | `h2` selection over a wire-format list |
 
-**A body is buffered rather than streamed.** `request` and `respond` take the bytes they are to
-send; nghttp2 pulls from that buffer as flow control allows. A body produced as it goes — a file
-read in pieces, a query streamed from a database — would need the deferred/resume path, which is not
-bound. That is the largest thing missing and it is a deliberate first cut, not an oversight.
+## A body written a piece at a time
+
+`request` and `respond` take the bytes they are to send, which is right for a body a program already
+has. **A body produced as it goes — an event stream, a proxied response, a file read in pieces — is
+the other pair of calls**, and the difference on the wire is *when the head goes out*: a response
+whose source never ends still has to say `200` before its first byte of body exists.
+
+```sysl
+sv.respond_stream(stream, [header(":status", "200"),
+    header("content-type", "text/event-stream")])?
+
+// ... and then, whenever there is something to say:
+sv.push(stream, "data: hello\n\n".bytes)?
+
+// ... and at the end, which for an event stream may be never:
+sv.finish(stream)?
+```
+
+**`push` answers an error where the stream has no open body**, which is the ordinary way a caller
+learns the peer gave up: a reset or a close drops the body, so the next push says so rather than
+writing into nothing. Trailers may be named at `finish`, which is the one place a streamed body can
+carry them — what was unknown until the body ended is exactly what a trailer is for.
+
+`request_stream` is the same on the client side, and it is what an upload of unknown length is.
+
+**Underneath it is nghttp2's deferred/resume path.** A source with nothing to hand over yet answers
+`NGHTTP2_ERR_DEFERRED`, which takes the stream out of the write loop until
+`nghttp2_session_resume_data` puts it back — where answering zero bytes would be read as an empty
+DATA frame and answering EOF would end a stream nobody had finished writing.
 
 **Server push is not bound**, and would not be much use if it were: every major browser has removed
 support for it. Extension frames, RFC 9218 priorities and nghttp2's own priority tree are absent for

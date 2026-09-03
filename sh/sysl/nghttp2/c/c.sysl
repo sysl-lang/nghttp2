@@ -212,6 +212,15 @@ extern "nghttp2_session_mem_recv2" session_mem_recv2(s: *Session, data: *u8, len
 extern "nghttp2_session_want_read" session_want_read(s: *Session) -> i32
 extern "nghttp2_session_want_write" session_want_write(s: *Session) -> i32
 
+// **What wakes a DATA source that answered `ERR_DEFERRED`.** A read callback with nothing to hand
+// over yet says so, and nghttp2 stops asking that stream until this is called -- nothing else makes
+// it ask again, so a body written a piece at a time stalls forever without it.
+//
+// **It answers `INVALID_ARGUMENT` where the stream does not exist OR where nothing is deferred**,
+// and the second is an ordinary case rather than a failure: bytes pushed while the source was still
+// runnable are picked up by the next send, with nothing to wake.
+extern "nghttp2_session_resume_data" session_resume_data(s: *Session, stream_id: i32) -> i32
+
 extern "nghttp2_session_terminate_session" session_terminate_session(s: *Session,
     error_code: u32) -> i32
 
