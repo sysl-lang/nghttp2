@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.0" }
+//       nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.1" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
@@ -21,11 +21,11 @@
 
 package {
   name    = "nghttp2"
-  version = "0.3.0"
+  version = "0.3.1"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.0.98"
+  sysl = "0.1.0-alpha.8"
 }
 
 // **`heap`, because every handle here is one nghttp2 allocated**: a session, a callbacks struct, an

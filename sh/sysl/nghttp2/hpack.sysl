@@ -103,7 +103,7 @@ struct Deflater
         val p = as_ptr(nva.view())
         val bound = c.hd_deflate_bound(self.d, p, nva.len())
 
-        var scratch: []u8 = [0; bound]
+        val scratch: []u8 = [0; bound]
 
         val n = c.hd_deflate_hd2(self.d, as_mut_ptr(scratch), bound, p, nva.len())
 
