@@ -72,7 +72,7 @@ private[nghttp2] to_nv(h: Header) -> c.Nv
 end to_nv
 
 private[nghttp2] to_nva(headers: []const Header) -> Buf[c.Nv]
-    var nva: Buf[c.Nv] = buf()
+    val nva: Buf[c.Nv] = buf()
 
     for h in headers
         nva.push(to_nv(h))
@@ -109,7 +109,7 @@ struct Deflater
 
         if n < 0 then return Err(failing(i32(n), "encoding a header block"))
 
-        var out: Buf[u8] = buf()
+        val out: Buf[u8] = buf()
 
         out.extend(scratch[0..<usize(n)])
 
@@ -136,7 +136,7 @@ impl Drop for Deflater
  * means "index nothing"**, which costs bytes and removes the compression side channel entirely.
  */
 deflater(max_table: usize = 4096) -> Result[&Deflater, Error]
-    var d: *c.HdDeflater = ptr_cast(0usize)
+    var d: *c.HdDeflater = null
 
     val r = c.hd_deflate_new(&d, max_table)
 
@@ -166,9 +166,9 @@ struct Inflater
      * rather than views.
      */
     inflate(*self, block: []const u8, final: bool = true) -> Result[Buf[Header], Error]
-        var out: Buf[Header] = buf()
+        val out: Buf[Header] = buf()
 
-        var nv = c.Nv(ptr_cast(0usize), ptr_cast(0usize), 0, 0, 0)
+        var nv = c.Nv(null, null, 0, 0, 0)
         var flags: i32 = 0
 
         var rest = block
@@ -215,7 +215,7 @@ impl Drop for Inflater
  * `resize_table` when that changes, rather than chosen when the decoder is made.
  */
 inflater() -> Result[&Inflater, Error]
-    var i: *c.HdInflater = ptr_cast(0usize)
+    var i: *c.HdInflater = null
 
     val r = c.hd_inflate_new(&i)
 

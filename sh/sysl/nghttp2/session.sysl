@@ -187,7 +187,7 @@ struct Session
         var total: usize = 0
 
         loop
-            var p: *u8 = ptr_cast(0usize)
+            var p: *u8 = null
 
             val n = c.session_mem_send2(self.s, &p)
 
@@ -235,10 +235,10 @@ struct Session
         trailers: Option[[]const Header] = None) -> Result[i32, Error]
 
         var nva = to_nva(headers)
-        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+        var prd = c.DataProvider(null, &pull)
 
-        val id = c.submit_request2(self.s, ptr_cast(0usize), as_ptr(nva.view()), nva.len(),
-            if sends_data(body, trailers) then &prd else ptr_cast(0usize), ptr_cast(0usize))
+        val id = c.submit_request2(self.s, null, as_ptr(nva.view()), nva.len(),
+            if sends_data(body, trailers) then &prd else null, null)
 
         if id < 0 then return Err(failing(id, "submitting a request"))
 
@@ -259,12 +259,12 @@ struct Session
         trailers: Option[[]const Header] = None) -> Result[unit, Error]
 
         var nva = to_nva(headers)
-        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+        var prd = c.DataProvider(null, &pull)
 
         self.hold(stream, body, trailers)
 
         val r = c.submit_response2(self.s, stream, as_ptr(nva.view()), nva.len(),
-            if sends_data(body, trailers) then &prd else ptr_cast(0usize))
+            if sends_data(body, trailers) then &prd else null)
 
         if r != 0 then return Err(failing(r, "submitting a response"))
 
@@ -286,10 +286,10 @@ struct Session
      */
     request_stream(*self, headers: []const Header) -> Result[i32, Error]
         var nva = to_nva(headers)
-        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+        var prd = c.DataProvider(null, &pull)
 
-        val id = c.submit_request2(self.s, ptr_cast(0usize), as_ptr(nva.view()), nva.len(), &prd,
-            ptr_cast(0usize))
+        val id = c.submit_request2(self.s, null, as_ptr(nva.view()), nva.len(), &prd,
+            null)
 
         if id < 0 then return Err(failing(id, "submitting a request"))
 
@@ -306,7 +306,7 @@ struct Session
      */
     respond_stream(*self, stream: i32, headers: []const Header) -> Result[unit, Error]
         var nva = to_nva(headers)
-        var prd = c.DataProvider(ptr_cast(0usize), &pull)
+        var prd = c.DataProvider(null, &pull)
 
         self.open_body(stream)
 
@@ -338,7 +338,7 @@ struct Session
                 // piece at a time may be a hundred thousand frames long, and a cursor that only
                 // ever moves forward would hold every byte of it for the life of the connection.
                 if b.sent > 0
-                    var left: Buf[u8] = buf()
+                    val left: Buf[u8] = buf()
 
                     left.extend(b.bytes.view()[b.sent..<b.bytes.len()])
 
@@ -368,7 +368,7 @@ struct Session
             var b = self.bodies.at(i)
 
             if b.stream == stream
-                var tail: Buf[Header] = buf()
+                val tail: Buf[Header] = buf()
 
                 trailers match
                     Some(ts) -> tail.extend(ts)
@@ -406,13 +406,13 @@ struct Session
     private hold(*self, stream: i32, body: Option[[]const u8], trailers: Option[[]const Header])
         if !sends_data(body, trailers) then return
 
-        var held: Buf[u8] = buf()
+        val held: Buf[u8] = buf()
 
         body match
             Some(bs) -> held.extend(bs)
             None -> ()
 
-        var tail: Buf[Header] = buf()
+        val tail: Buf[Header] = buf()
 
         trailers match
             Some(ts) -> tail.extend(ts)
@@ -425,7 +425,7 @@ struct Session
      * requires; this is for saying something in particular.
      */
     settings(*self, values: []const Setting) -> Result[unit, Error]
-        var iv: Buf[c.SettingsEntry] = buf()
+        val iv: Buf[c.SettingsEntry] = buf()
 
         for v in values
             iv.push(entry(v))
@@ -441,7 +441,7 @@ struct Session
      * it is the ones above it the peer must retry elsewhere. `terminate` is the other one.
      */
     goaway(*self, last_stream: i32, code: u32 = c.NO_ERROR) -> Result[unit, Error]
-        val r = c.submit_goaway(self.s, c.FLAG_NONE, last_stream, code, ptr_cast(0usize), 0)
+        val r = c.submit_goaway(self.s, c.FLAG_NONE, last_stream, code, null, 0)
 
         if r != 0 then Err(failing(r, "submitting GOAWAY")) else Ok(())
     end goaway
@@ -473,7 +473,7 @@ struct Session
      * `Ping(true)`.
      */
     ping(*self) -> Result[unit, Error]
-        val r = c.submit_ping(self.s, c.FLAG_NONE, ptr_cast(0usize))
+        val r = c.submit_ping(self.s, c.FLAG_NONE, null)
 
         if r != 0 then Err(failing(r, "submitting PING")) else Ok(())
     end ping
@@ -572,7 +572,7 @@ private on_data_chunk(s: *c.Session, flags: u8, stream: i32, data: *u8, len: usi
 
     var sess = held(user)
 
-    var chunk: Buf[u8] = buf()
+    val chunk: Buf[u8] = buf()
 
     chunk.extend(data[0..<len])
 
@@ -619,7 +619,7 @@ private on_frame(s: *c.Session, f: *c.Frame, user: *u8) -> i32
     if ty == c.FRAME_HEADERS
         val h: *c.HeadersFrame = ptr_cast(f)
 
-        var block: Buf[Header] = buf()
+        val block: Buf[Header] = buf()
 
         block.extend(sess.pending.view())
         sess.pending.clear()
@@ -734,7 +734,7 @@ options() -> Options = Options(true)
 no_auto_window_update() -> Options = Options(false)
 
 private make(server: bool, o: Options) -> Result[&Session, Error]
-    var cbs: *c.Callbacks = ptr_cast(0usize)
+    var cbs: *c.Callbacks = null
 
     val made = c.callbacks_new(&cbs)
 
@@ -746,13 +746,13 @@ private make(server: bool, o: Options) -> Result[&Session, Error]
     c.callbacks_set_on_data_chunk_recv(cbs, &on_data_chunk)
     c.callbacks_set_on_stream_close(cbs, &on_stream_close)
 
-    var s: *c.Session = ptr_cast(0usize)
+    var s: *c.Session = null
 
     var opened: i32 = 0
 
     // **The option struct is nghttp2's own and is freed here**, the session having copied what it
     // needed out of it -- which is the arrangement the callback table above already has.
-    var opt: *c.Options = ptr_cast(0usize)
+    var opt: *c.Options = null
 
     if !o.auto_window_update
         val room = c.option_new(&opt)
@@ -766,14 +766,14 @@ private make(server: bool, o: Options) -> Result[&Session, Error]
 
     if server
         if o.auto_window_update
-            opened = c.session_server_new(&s, cbs, ptr_cast(0usize))
+            opened = c.session_server_new(&s, cbs, null)
         else
-            opened = c.session_server_new2(&s, cbs, ptr_cast(0usize), opt)
+            opened = c.session_server_new2(&s, cbs, null, opt)
     else
         if o.auto_window_update
-            opened = c.session_client_new(&s, cbs, ptr_cast(0usize))
+            opened = c.session_client_new(&s, cbs, null)
         else
-            opened = c.session_client_new2(&s, cbs, ptr_cast(0usize), opt)
+            opened = c.session_client_new2(&s, cbs, null, opt)
 
     if !o.auto_window_update then c.option_del(opt)
 
@@ -793,7 +793,7 @@ private make(server: bool, o: Options) -> Result[&Session, Error]
     // **The protocol requires SETTINGS as the first frame, so an empty one goes out here.** A
     // session that never sent one leaves the peer waiting for something that never comes, and the
     // symptom is a connection that opens and then does nothing at all.
-    val settled = c.submit_settings(s, c.FLAG_NONE, ptr_cast(0usize), 0)
+    val settled = c.submit_settings(s, c.FLAG_NONE, null, 0)
 
     if settled != 0 then return Err(failing(settled, "queuing the opening SETTINGS"))
 

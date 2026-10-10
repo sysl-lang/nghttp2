@@ -33,7 +33,7 @@ import sysl.buf.{Buf, buf}
 offers_h2(offered: []const u8) -> bool
     if offered.len == 0 then return false
 
-    var name: *u8 = ptr_cast(0usize)
+    var name: *u8 = null
     var namelen: u8 = 0
 
     c.select_alpn(&name, &namelen, as_ptr(offered), u32(offered.len)) == 1
@@ -46,7 +46,7 @@ end offers_h2
  * is refused.
  */
 alpn_list(protocols: []const string) -> Result[Buf[u8], Error]
-    var out: Buf[u8] = buf()
+    val out: Buf[u8] = buf()
 
     for name in protocols
         val bytes = name.bytes

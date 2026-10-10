@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.1" }
+//       nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.2" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
@@ -21,7 +21,7 @@
 
 package {
   name    = "nghttp2"
-  version = "0.3.1"
+  version = "0.3.2"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.

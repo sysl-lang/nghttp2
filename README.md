@@ -5,7 +5,7 @@
 
 ```
 dependencies {
-  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.1" }
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.2" }
 }
 ```
 
