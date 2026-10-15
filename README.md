@@ -3,6 +3,8 @@
 **HTTP/2 for sysl** — HPACK, and a session that speaks the framing layer. A binding of
 [nghttp2](https://nghttp2.org), the library curl, Apache and Envoy use.
 
+*An independent sysl package for nghttp2. It is not affiliated with or endorsed by nghttp2's authors or trademark holders.*
+
 ```
 dependencies {
   nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.2" }
