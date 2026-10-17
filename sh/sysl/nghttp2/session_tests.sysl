@@ -41,12 +41,19 @@ end Pair
 private pair() -> Pair = Pair(client().unwrap(), server().unwrap())
 
 // Every event an end has queued, as one line each -- so an assertion says what the whole exchange
-// looked like rather than which field of which event disagreed.
-private drain(s: &Session) -> string
+// looked like rather than which field of which event disagreed. **`BeginHeaders` is left out**,
+// because it carries nothing the `Headers` after it does not; `drain_all` keeps it, and the tests
+// about it are the ones that use that.
+private drain(s: &Session) -> string = drain_with(s, false)
+
+private drain_all(s: &Session) -> string = drain_with(s, true)
+
+private drain_with(s: &Session, begins: bool) -> string
     var out = ""
 
     loop
         s.next_event() match
+            Some(BeginHeaders(_, _)) if !begins -> ()
             Some(e) ->
                 if out.len > 0 then out += "|"
 
@@ -54,9 +61,10 @@ private drain(s: &Session) -> string
             None -> break
 
     out
-end drain
+end drain_with
 
 private describe(e: Event) -> string = e match
+    BeginHeaders(id, k) -> s"begin ${id} ${kind_name(k)}"
     Headers(id, hs, k) -> s"headers ${id} ${kind_name(k)} ${fields(hs)}"
     Data(id, bs) -> s"data ${id} ${from_utf8_unchecked(bs.view())}"
     StreamEnd(id) -> s"end ${id}"
@@ -682,3 +690,143 @@ a_streamed_body_drops_what_it_has_sent()
     assert(said.starts_with("data 1 x"))
     assert_eq(drain(p.client), "end 1|close 1 NO_ERROR")
 end a_streamed_body_drops_what_it_has_sent
+
+// -- BeginHeaders --------------------------------------------------------------------------------
+
+// A frame by hand: the nine-byte header (length, type, flags, stream) and the payload. A session
+// cannot be made to split a header block across frames, so the tests that need one write it.
+private frame(ty: u8, flags: u8, stream: u8, payload: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.push(0)
+    out.push(0)
+    out.push(u8(payload.len))
+    out.push(ty)
+    out.push(flags)
+    out.push(0)
+    out.push(0)
+    out.push(0)
+    out.push(stream)
+    out.extend(payload)
+
+    out
+end frame
+
+// :method GET, :scheme https, :path /, then :authority example.test as a literal.
+private request_head() -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.extend([u8(0x82), 0x87, 0x84, 0x41, 12])
+    out.extend("example.test".bytes)
+
+    out
+end request_head
+
+@test("a request's BeginHeaders comes before its Headers")
+begin_headers_precedes_headers()
+    var p = pair()
+
+    p.client.request(get("/things")).unwrap()
+    p.flush()
+
+    assert_eq(drain_all(p.server),
+        "settings|begin 1 request|headers 1 request :method=GET,:scheme=https,:path=/things," +
+        ":authority=example.test|end 1")
+end begin_headers_precedes_headers
+
+@test("a response's BeginHeaders says it is a response")
+begin_headers_names_a_response()
+    var p = pair()
+
+    p.client.request(get("/things")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, ok("text/plain"), Some("hi".bytes)).unwrap()
+    p.flush()
+
+    assert_eq(drain_all(p.client),
+        "settings|begin 1 response|headers 1 response :status=200,content-type=text/plain|" +
+        "data 1 hi|end 1|close 1 NO_ERROR")
+end begin_headers_names_a_response
+
+// **This is the case the event exists for**: the block has begun, and nothing says it has ended
+// until the CONTINUATION arrives.
+@test("a HEADERS frame without END_HEADERS gives BeginHeaders and no Headers until its CONTINUATION")
+begin_headers_waits_for_the_continuation()
+    var p = pair()
+
+    p.flush()
+    drain(p.server)
+
+    val head = request_head()
+
+    p.server.receive(frame(1, 0x01, 1, head.view()[0..<2]).view()).unwrap()
+
+    assert_eq(drain_all(p.server), "begin 1 request")
+
+    p.server.receive(frame(9, 0x04, 1, head.view()[2..<head.len()]).view()).unwrap()
+
+    assert_eq(drain_all(p.server),
+        "headers 1 request :method=GET,:scheme=https,:path=/,:authority=example.test|end 1")
+end begin_headers_waits_for_the_continuation
+
+@test("trailers are a second BeginHeaders on the same stream")
+trailers_begin_again()
+    var p = pair()
+
+    p.client.request(get("/stream")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, [header(":status", "200"), header("trailer", "x-count")],
+        Some("rows".bytes), Some([header("x-count", "4")])).unwrap()
+    p.flush()
+
+    assert_eq(drain_all(p.client),
+        "settings|begin 1 response|headers 1 response :status=200,trailer=x-count|data 1 rows|" +
+        "begin 1 trailer|headers 1 trailer x-count=4|end 1|close 1 NO_ERROR")
+end trailers_begin_again
+
+@test("two streams' header blocks interleave, each begun under its own stream")
+begin_headers_interleave()
+    var p = pair()
+
+    p.flush()
+    drain(p.server)
+
+    val head = request_head()
+
+    p.server.receive(frame(1, 0x01, 1, head.view()[0..<2]).view()).unwrap()
+
+    assert_eq(drain_all(p.server), "begin 1 request")
+
+    // Another stream may not begin while a block is open -- RFC 9113 requires CONTINUATION to
+    // follow -- so the interleaving is of whole blocks, on streams 1 and 3.
+    p.server.receive(frame(9, 0x04, 1, head.view()[2..<head.len()]).view()).unwrap()
+    p.server.receive(frame(1, 0x05, 3, head.view()).view()).unwrap()
+
+    assert_eq(drain_all(p.server),
+        "headers 1 request :method=GET,:scheme=https,:path=/,:authority=example.test|end 1|" +
+        "begin 3 request|headers 3 request :method=GET,:scheme=https,:path=/,:authority=example.test|end 3")
+end begin_headers_interleave
+
+// **A BeginHeaders is answered by a reset or an error when the block is bad.** An indexed field
+// with index zero is not a thing HPACK has, so the header block fails to decode after the frame has
+// begun; the peer is sent a GOAWAY, and no `Headers` follows.
+@test("a broken header block after BeginHeaders is answered by a GOAWAY, not by Headers")
+a_broken_block_after_begin_headers()
+    var p = pair()
+
+    p.flush()
+    drain(p.server)
+
+    // nghttp2 answers a compression error with a GOAWAY rather than by failing the call.
+    p.server.receive(frame(1, 0x05, 1, [u8(0x80)]).view()).unwrap()
+
+    assert_eq(drain_all(p.server), "begin 1 request")
+
+    p.flush()
+
+    assert_eq(drain(p.client), "settings|goaway 1 COMPRESSION_ERROR")
+end a_broken_block_after_begin_headers

@@ -7,7 +7,7 @@
 
 ```
 dependencies {
-  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.3.2" }
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.4.0" }
 }
 ```
 
@@ -67,6 +67,11 @@ calls back from inside `receive`, which is a place a caller's own code has no bu
 cannot submit frames there without reentering the library, it cannot fail usefully, and a closure it
 registered would have to be kept alive by the session. Recording what happened and handing it over
 afterwards costs one copy of each header block and buys ordinary sysl control flow.
+
+**`BeginHeaders(stream, kind)` announces a header block before its fields arrive**, for header-read
+deadlines: start a clock there and stop it at the `Headers` that ends the block, so a peer
+dribbling CONTINUATION frames costs one stream (a reset) rather than the connection. It is always
+followed by `Headers` for that stream, or by a stream reset or a session error.
 
 ## HPACK on its own
 

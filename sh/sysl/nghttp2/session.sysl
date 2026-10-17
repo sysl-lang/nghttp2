@@ -54,6 +54,14 @@ end HeaderKind
  * ordinary sysl control flow.
  */
 enum Event
+    /** A header block has begun on this stream, and its fields have not arrived yet. **It is for
+     * header-read deadlines**: a caller starts a clock here and stops it at the `Headers` that ends
+     * the block, so a peer that dribbles CONTINUATION frames costs that stream (a reset) rather than
+     * the connection. A `BeginHeaders` is always followed by a `Headers` for the same stream, or by
+     * a stream reset or a session error. The kind is the one the `Headers` will carry.
+     */
+    BeginHeaders(stream: i32, kind: HeaderKind)
+
     /** A complete header block: a request at a server, a response at a client, or trailers. */
     Headers(stream: i32, headers: Buf[Header], kind: HeaderKind)
 
@@ -550,6 +558,16 @@ private on_begin_headers(s: *c.Session, f: *c.Frame, user: *u8) -> i32
     var sess = held(user)
 
     sess.pending.clear()
+
+    // **Only a HEADERS frame is announced**: a PUSH_PROMISE also begins a block, but this binding
+    // never delivers it as `Headers`, and the promise would break the rule that every
+    // `BeginHeaders` is answered.
+    val hd: *c.FrameHd = ptr_cast(f)
+
+    if hd.ty == c.FRAME_HEADERS
+        val h: *c.HeadersFrame = ptr_cast(f)
+
+        sess.events.push(BeginHeaders(hd.stream_id, kind_of(h.cat)))
 
     0
 end on_begin_headers
