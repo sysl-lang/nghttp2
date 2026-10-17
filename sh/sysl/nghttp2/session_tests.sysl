@@ -10,7 +10,8 @@ module sh.sysl.nghttp2
 // needs a port, and no order of events that depends on the kernel.
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{from_utf8_unchecked, Search}
+import sysl.testing.skip
+import sysl.text.{from_utf8_unchecked, repeat, Search}
 
 // Both ends of a connection, and the wire between them.
 private struct Pair
@@ -66,6 +67,7 @@ end drain_with
 private describe(e: Event) -> string = e match
     BeginHeaders(id, k) -> s"begin ${id} ${kind_name(k)}"
     Headers(id, hs, k) -> s"headers ${id} ${kind_name(k)} ${fields(hs)}"
+    HeaderListTooLarge(id, k) -> s"too large ${id} ${kind_name(k)}"
     Data(id, bs) -> s"data ${id} ${from_utf8_unchecked(bs.view())}"
     StreamEnd(id) -> s"end ${id}"
     StreamClose(id, code) -> s"close ${id} ${error_name(code)}"
@@ -830,3 +832,358 @@ a_broken_block_after_begin_headers()
 
     assert_eq(drain(p.client), "settings|goaway 1 COMPRESSION_ERROR")
 end a_broken_block_after_begin_headers
+
+// -- the header-list limit -----------------------------------------------------------------------
+
+// How many bytes of the C heap are in use (`c/heap.c`), or 0 where the allocator cannot say.
+extern "sysl_nghttp2_heap_in_use" heap_in_use() -> usize
+
+// Every event, with a header block reduced to how many fields it held -- the blocks here are tens
+// of kilobytes, and what the tests ask is whether one arrived, not what was in it.
+private outline(s: &Session) -> string
+    var out = ""
+
+    loop
+        s.next_event() match
+            Some(BeginHeaders(_, _)) -> ()
+            Some(e) ->
+                if out.len > 0 then out += "|"
+
+                out += e match
+                    Headers(id, hs, k) -> s"headers ${id} ${kind_name(k)} ${hs.len()} fields"
+                    other -> describe(other)
+            None -> break
+
+    out
+end outline
+
+// An HPACK string literal, not Huffman-coded: its length as a 7-bit-prefix integer, then its bytes.
+private hpack_string(out: *Buf[u8], s: string)
+    var n = s.len
+
+    if n < 127
+        out.push(u8(n))
+    else
+        out.push(127)
+
+        n -= 127
+
+        while n >= 128
+            out.push(u8(n % 128 + 128))
+
+            n /= 128
+
+        out.push(u8(n))
+
+    out.extend(s.bytes)
+end hpack_string
+
+// A field written out in full. `indexed` adds it to the dynamic table (RFC 7541 §6.2.1); otherwise
+// it is a literal without indexing (§6.2.2), which leaves the table as it was.
+private literal(out: *Buf[u8], name: string, value: string, indexed: bool)
+    out.push(if indexed then 0x40 else 0)
+
+    hpack_string(out, name)
+    hpack_string(out, value)
+
+// The four fields of a GET as literals that touch no table: 178 bytes in RFC 9113's measure.
+private plain_head(out: *Buf[u8])
+    literal(out, ":method", "GET", false)
+    literal(out, ":scheme", "https", false)
+    literal(out, ":path", "/", false)
+    literal(out, ":authority", "example.test", false)
+
+// A GET whose header list measures exactly `total`, filled out with `x-fill` fields.
+private request_of(total: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    plain_head(&out)
+
+    var used: usize = 178
+
+    while used < total
+        val room = total - used - 38
+        val n = if room > 2000 then 1000 else room
+
+        literal(&out, "x-fill", repeat("a", n), false)
+
+        used += 38 + n
+
+    out
+end request_of
+
+// A frame of any length up to the 16 KiB a session accepts by default.
+private long_frame(ty: u8, flags: u8, stream: u8, payload: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    out.push(u8(payload.len / 65536))
+    out.push(u8(payload.len / 256 % 256))
+    out.push(u8(payload.len % 256))
+    out.push(ty)
+    out.push(flags)
+    out.extend([u8(0), 0, 0, stream])
+    out.extend(payload)
+
+    out
+end long_frame
+
+// A header block handed to `to` as a HEADERS frame and as many CONTINUATIONs as it takes, the stream
+// ended with it. Answers how many frames that was.
+private send_block(to: &Session, stream: u8, block: []const u8) -> usize
+    val most: usize = 16384
+
+    var at: usize = 0
+    var frames: usize = 0
+
+    loop
+        val n = if block.len - at > most then most else block.len - at
+        val last = at + n == block.len
+
+        var flags: u8 = if last then 0x04 else 0
+
+        if frames == 0 then flags |= 0x01
+
+        to.receive(long_frame(if frames == 0 then 1 else 9, flags, stream, block[at..<at + n]).view())
+            .unwrap()
+
+        at += n
+        frames += 1
+
+        if last then break
+
+    frames
+end send_block
+
+// A server that has heard the client's preface and SETTINGS and has nothing queued.
+private ready(p: *Pair)
+    p.flush()
+
+    drain(p.server)
+
+@test("a session's header-list limit is 64 KiB until something names another")
+the_limit_defaults_to_64_kib()
+    var p = pair()
+
+    assert_eq(p.server.max_header_list(), 65536)
+    assert_eq(p.client.max_header_list(), 65536)
+end the_limit_defaults_to_64_kib
+
+@test("a header list of exactly the limit is delivered")
+a_list_at_the_limit_is_delivered()
+    var p = pair()
+
+    ready(&p)
+
+    val block = request_of(65536)
+
+    send_block(p.server, 1, block.view())
+
+    // The four pseudo-fields and 63 fillers: 178 + 62 * 1038 + (38 + 964) is 65536 exactly.
+    assert_eq(outline(p.server), "headers 1 request 67 fields|end 1")
+end a_list_at_the_limit_is_delivered
+
+@test("a header list one byte over the limit is HeaderListTooLarge, and the stream stays open")
+a_list_one_over_the_limit_is_refused()
+    var p = pair()
+
+    ready(&p)
+
+    send_block(p.server, 1, request_of(65537).view())
+
+    assert_eq(drain_all(p.server), "begin 1 request|too large 1 request|end 1")
+end a_list_one_over_the_limit_is_refused
+
+@test("an 80,000-byte header list over CONTINUATION frames is refused at the end of the block")
+a_long_list_over_continuations_is_refused()
+    var p = pair()
+
+    ready(&p)
+
+    assert_eq(send_block(p.server, 1, request_of(80000).view()), 5)
+    assert_eq(drain_all(p.server), "begin 1 request|too large 1 request|end 1")
+end a_long_list_over_continuations_is_refused
+
+@test("a session made with a header-list limit keeps that one, above the default or below it")
+the_option_overrides_the_default()
+    var p = Pair(client().unwrap(), server_with(options().max_header_list(100000)).unwrap())
+
+    ready(&p)
+
+    assert_eq(p.server.max_header_list(), 100000)
+
+    send_block(p.server, 1, request_of(80000).view())
+
+    assert_eq(outline(p.server), "headers 1 request 80 fields|end 1")
+
+    var q = Pair(client().unwrap(), server_with(options().max_header_list(1000)).unwrap())
+
+    ready(&q)
+
+    send_block(q.server, 1, request_of(1001).view())
+    send_block(q.server, 3, request_of(1000).view())
+
+    assert_eq(outline(q.server), "too large 1 request|end 1|headers 3 request 5 fields|end 3")
+end the_option_overrides_the_default
+
+@test("the limit this end advertises is the one it enforces, unless an option names one")
+the_advertised_limit_is_enforced()
+    var p = pair()
+
+    p.server.settings([MaxHeaderListSize(1000)]).unwrap()
+
+    assert_eq(p.server.max_header_list(), 1000)
+
+    ready(&p)
+
+    send_block(p.server, 1, request_of(1001).view())
+
+    assert_eq(outline(p.server), "too large 1 request|end 1")
+
+    var q = Pair(client().unwrap(), server_with(options().max_header_list(5000)).unwrap())
+
+    q.server.settings([MaxHeaderListSize(1000)]).unwrap()
+
+    assert_eq(q.server.max_header_list(), 5000)
+end the_advertised_limit_is_enforced
+
+// **The answer the event exists for**: the server hears the request was too large, says 431 on the
+// same stream, and the client reads it as an ordinary response.
+@test("a server answers an oversized request with 431, and the client receives it")
+an_oversized_request_is_answered_431()
+    var p = Pair(client().unwrap(), server_with(options().max_header_list(1000)).unwrap())
+
+    p.client.request([header(":method", "GET"), header(":scheme", "https"), header(":path", "/"),
+        header(":authority", "example.test"), header("x-big", repeat("b", 2000))]).unwrap()
+    p.flush()
+
+    assert_eq(drain_all(p.server), "settings|begin 1 request|too large 1 request|end 1")
+
+    p.server.respond(1, [header(":status", "431")]).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.client), "settings|headers 1 response :status=431|end 1|close 1 NO_ERROR")
+    assert_eq(drain(p.server), "close 1 NO_ERROR")
+end an_oversized_request_is_answered_431
+
+// **The field that tells is the one AFTER the limit was crossed.** nghttp2's client puts `x-key` in
+// its HPACK table and the next request names it by index; a server that had stopped decoding at the
+// limit would not have it, and the second request would fail to decode.
+@test("after an oversized block, the next request decodes against the same HPACK table")
+the_table_stays_in_step_after_an_oversized_block()
+    var p = Pair(client().unwrap(), server_with(options().max_header_list(1000)).unwrap())
+
+    p.client.request([header(":method", "GET"), header(":scheme", "https"), header(":path", "/"),
+        header(":authority", "example.test"), header("x-big", repeat("b", 2000)),
+        header("x-key", "secret")]).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server), "settings|too large 1 request|end 1")
+
+    p.client.request([header(":method", "GET"), header(":scheme", "https"), header(":path", "/next"),
+        header(":authority", "example.test"), header("x-key", "secret")]).unwrap()
+    p.flush()
+
+    assert_eq(drain(p.server),
+        "headers 3 request :method=GET,:scheme=https,:path=/next,:authority=example.test," +
+        "x-key=secret|end 3")
+end the_table_stays_in_step_after_an_oversized_block
+
+// The same by hand, where the bytes say exactly what is in the table: a 4 KB field added once and
+// then named by index nineteen times takes the block past 64 KiB, and a field added after that is
+// what the next block refers to.
+@test("a field indexed after the limit was crossed is in the table for the next block")
+an_index_past_the_limit_is_kept()
+    var p = pair()
+
+    ready(&p)
+
+    val pad = repeat("p", 4000)
+
+    var first: Buf[u8] = buf()
+
+    plain_head(&first)
+    literal(&first, "x-pad", pad, true)
+
+    for i in 0..<19
+        first.push(0xbe)
+
+    literal(&first, "x-key", "secret", true)
+
+    send_block(p.server, 1, first.view())
+
+    assert_eq(outline(p.server), "too large 1 request|end 1")
+
+    // x-key is now index 62 and x-pad 63.
+    var next: Buf[u8] = buf()
+
+    plain_head(&next)
+    next.extend([u8(0xbe), 0xbf])
+
+    send_block(p.server, 3, next.view())
+
+    assert_eq(drain(p.server),
+        s"headers 3 request :method=GET,:scheme=https,:path=/,:authority=example.test," +
+        s"x-key=secret,x-pad=${pad}|end 3")
+end an_index_past_the_limit_is_kept
+
+// **The attack the limit is for.** Twenty thousand one-byte references to a 4 KB field are 20 KB on
+// the wire and 80 MB decoded; a session that kept the fields would hold all of it. What the session
+// may hold is the limit, and the heap is measured across the `receive` to prove it.
+//
+// **The control is the same bomb at a server whose limit is raised past it**, which must hold the
+// whole 80 MB: without it a measurement that read zero for any reason would pass as well.
+private bomb_growth(sv: &Session) -> usize
+    var p = Pair(client().unwrap(), sv)
+
+    ready(&p)
+
+    var bomb: Buf[u8] = buf()
+
+    plain_head(&bomb)
+    literal(&bomb, "x-pad", repeat("p", 4000), true)
+
+    for i in 0..<19999
+        bomb.push(0xbe)
+
+    val before = heap_in_use()
+
+    send_block(p.server, 1, bomb.view())
+
+    val after = heap_in_use()
+
+    if after > before then after - before else 0
+end bomb_growth
+
+@test("an HPACK bomb of 80 MB decoded grows the heap by well under a megabyte")
+an_hpack_bomb_is_bounded()
+    if heap_in_use() == 0 then skip("this libc does not say how much of its heap is in use")
+
+    val sv = server().unwrap()
+    val grew = bomb_growth(sv)
+
+    assert(grew < 1048576 / 4, s"80 MB of decoded fields grew the heap by ${grew} bytes")
+    assert_eq(outline(sv), "too large 1 request|end 1")
+
+    val open = server_with(options().max_header_list(200000000)).unwrap()
+    val kept = bomb_growth(open)
+
+    assert(kept > 70000000, s"a server allowed the whole bomb grew the heap by only ${kept} bytes")
+    assert_eq(outline(open), "headers 1 request 20004 fields|end 1")
+end an_hpack_bomb_is_bounded
+
+@test("trailers past the limit are HeaderListTooLarge with the trailer kind")
+oversized_trailers_are_refused()
+    var p = Pair(client_with(options().max_header_list(1000)).unwrap(), server().unwrap())
+
+    p.client.request(get("/rows")).unwrap()
+    p.flush()
+    drain(p.server)
+
+    p.server.respond(1, [header(":status", "200")], Some("rows".bytes),
+        Some([header("x-sum", repeat("s", 2000))])).unwrap()
+    p.flush()
+
+    assert_eq(drain_all(p.client),
+        "settings|begin 1 response|headers 1 response :status=200|data 1 rows|begin 1 trailer|" +
+        "too large 1 trailer|end 1|close 1 NO_ERROR")
+end oversized_trailers_are_refused

@@ -7,7 +7,7 @@
 
 ```
 dependencies {
-  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.4.0" }
+  nghttp2 { git = "github.com/sysl-lang/nghttp2", version = "0.5.0" }
 }
 ```
 
@@ -71,7 +71,19 @@ afterwards costs one copy of each header block and buys ordinary sysl control fl
 **`BeginHeaders(stream, kind)` announces a header block before its fields arrive**, for header-read
 deadlines: start a clock there and stop it at the `Headers` that ends the block, so a peer
 dribbling CONTINUATION frames costs one stream (a reset) rather than the connection. It is always
-followed by `Headers` for that stream, or by a stream reset or a session error.
+followed by `Headers` or `HeaderListTooLarge` for that stream, or by a stream reset or a session
+error.
+
+**Every session limits how large a peer's header block may decode to**, because nghttp2 does not:
+it sends `SETTINGS_MAX_HEADER_LIST_SIZE` and checks nothing against it, and HPACK lets one byte on
+the wire name a 4 KB field, so 20 KB of indexed references decode to 80 MB. The measure is RFC
+9113's — each field's name and value plus 32 bytes — and the limit is, in order, the one named with
+`options().max_header_list(n)`, the `MaxHeaderListSize` this end last sent with `settings`, or
+**64 KiB**. A block past it arrives as `HeaderListTooLarge(stream, kind)` in place of `Headers`: the
+fields past the limit were decoded and thrown away, so the session never holds more than the limit,
+and the HPACK table stays in step with the peer's. The stream stays open — a server answers `431`
+(RFC 9113 §8.2.2) or resets it; a client resets it. `session.max_header_list()` says which limit is
+in force.
 
 ## HPACK on its own
 
@@ -169,8 +181,9 @@ prior-knowledge `h2c`, which is what one talks to a service one controls, needs 
 
 ## Notes for anyone reading the source
 
-**There is no C shim.** All 181 of nghttp2's exported symbols were surveyed and nothing needed
-wrapping: the constants are enumerators, which a `c const` block reads, and nothing in the callback
+**There is no C shim.** (`c/heap.c` is the one C file, and it binds nothing of nghttp2's: it asks
+the allocator how much of the heap is in use, for the test that proves an HPACK bomb is bounded.)
+All 181 of nghttp2's exported symbols were surveyed and nothing needed wrapping: the constants are enumerators, which a `c const` block reads, and nothing in the callback
 surface crosses by value — so every callback is an ordinary sysl function whose address is taken
 with `&f`, rather than an `@export`ed one.
 
@@ -192,7 +205,7 @@ deletes it.
 sysl test .
 ```
 
-**49 passed, 0 failed.**
+**74 passed, 0 failed.**
 
 The oracle for HPACK is RFC 7541's own Appendix C.4, not nghttp2: three request blocks printed in
 hexadecimal with what each decodes to, and none of those numbers came from this library. The three
@@ -203,6 +216,12 @@ the other way: C.4.1's seventeen bytes are pinned byte for byte.
 The session tests wire a client and a server to each other in memory and assert on the whole
 transcript of events, which is how a real preface, real flow control and real interleaving get
 checked with nothing that can hang.
+
+The header-list limit is checked at the byte: a list of exactly 65,536 bytes is delivered and one of
+65,537 is not. The HPACK bomb — a 4 KB field indexed once and then named 19,999 times, 24 KB on the
+wire — grows the heap by under 7 KB at a default session, measured with the allocator's own
+counters, against 86 MB at a session whose limit was raised past it; that second figure is in the
+test, so a measurement that read nothing would fail it.
 
 Run under AddressSanitizer with `SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .` — clean, and
 `nm -u` confirms 20 ASan symbols including `__asan_memcpy`, so the instrumentation is real. **It

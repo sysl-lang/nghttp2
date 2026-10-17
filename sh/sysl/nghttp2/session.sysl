@@ -57,13 +57,28 @@ enum Event
     /** A header block has begun on this stream, and its fields have not arrived yet. **It is for
      * header-read deadlines**: a caller starts a clock here and stops it at the `Headers` that ends
      * the block, so a peer that dribbles CONTINUATION frames costs that stream (a reset) rather than
-     * the connection. A `BeginHeaders` is always followed by a `Headers` for the same stream, or by
-     * a stream reset or a session error. The kind is the one the `Headers` will carry.
+     * the connection. A `BeginHeaders` is always followed by a `Headers` or a `HeaderListTooLarge`
+     * for the same stream, or by a stream reset or a session error. The kind is the one that answer
+     * will carry.
      */
     BeginHeaders(stream: i32, kind: HeaderKind)
 
     /** A complete header block: a request at a server, a response at a client, or trailers. */
     Headers(stream: i32, headers: Buf[Header], kind: HeaderKind)
+
+    /** A header block that decoded to more than this end accepts, in place of its `Headers`.
+     *
+     * **The size is RFC 9113's**: each field's name and value plus 32 bytes, summed over the block,
+     * against `Session.max_header_list`. The fields past the limit are decoded and thrown away
+     * rather than kept, so a peer cannot make this end hold more than the limit however the block
+     * was compressed -- an indexed field costs one byte to send and its whole length to decode.
+     *
+     * **The stream stays open and the connection stays in step.** The block was decoded to its end,
+     * so the HPACK table both ends share is the one the peer thinks it is; what happens to the
+     * stream is the caller's choice. A server answers `431` (RFC 9113 §8.2.2 suggests it) or resets
+     * the stream; a client resets it.
+     */
+    HeaderListTooLarge(stream: i32, kind: HeaderKind)
 
     /** A piece of a body. **One event per DATA frame, not one per stream** -- a body arrives in as
      * many chunks as the peer chose to send, and joining them is the caller's business.
@@ -168,6 +183,16 @@ struct Session
     // for that -- a sentence that sends a reader looking at the stream rather than at how the session
     // was made, so the check is here and the sentence is this file's.
     private auto_window: bool
+
+    // The header-list limit the session was made with, and the MAX_HEADER_LIST_SIZE this end last
+    // advertised. `max_header_list` says which one rules.
+    private header_cap: Option[usize]
+    private advertised: Option[usize]
+
+    // The block currently arriving, measured as RFC 9113 measures it, and whether it has gone past
+    // the limit -- after which its fields are decoded and dropped.
+    private block_bytes: usize
+    private block_over: bool
 
     /** Whether this end is the server. */
     is_server(self) -> bool = c.session_check_server_session(self.s) != 0
@@ -440,7 +465,16 @@ struct Session
 
         val r = c.submit_settings(self.s, c.FLAG_NONE, as_ptr(iv.view()), iv.len())
 
-        if r != 0 then Err(failing(r, "submitting SETTINGS")) else Ok(())
+        if r != 0 then return Err(failing(r, "submitting SETTINGS"))
+
+        // **What this end advertises is what it enforces**, unless the session was made with a
+        // limit of its own. nghttp2 sends the setting and checks nothing against it.
+        for v in values
+            v match
+                MaxHeaderListSize(n) -> self.advertised = Some(usize(n))
+                _ -> ()
+
+        Ok(())
     end settings
 
     /** Tell the peer this connection is closing: the last stream that will be processed, and why.
@@ -518,6 +552,20 @@ struct Session
     /** What the peer asked for, for one SETTINGS parameter. */
     peer_setting(self, s: Setting) -> u32 = c.session_get_remote_settings(self.s, entry(s).settings_id)
 
+    /** The most a header block from the peer may decode to before it is answered with
+     * `HeaderListTooLarge`, in RFC 9113's measure: each field's name and value plus 32 bytes.
+     *
+     * The limit the session was made with if it was given one (`Options.max_header_list`); else the
+     * `MaxHeaderListSize` this end last sent in `settings`; else **64 KiB, so there is always a
+     * limit**. nghttp2 itself enforces none, and HPACK lets a peer that sends a few kilobytes make
+     * the decoder produce many megabytes.
+     */
+    max_header_list(self) -> usize = self.header_cap match
+        Some(n) -> n
+        None -> self.advertised match
+            Some(n) -> n
+            None -> DefaultMaxHeaderList
+
     /** The highest stream identifier this end has processed -- what a GOAWAY should name. */
     last_stream(self) -> i32 = c.session_get_last_proc_stream_id(self.s)
 end Session
@@ -558,6 +606,8 @@ private on_begin_headers(s: *c.Session, f: *c.Frame, user: *u8) -> i32
     var sess = held(user)
 
     sess.pending.clear()
+    sess.block_bytes = 0
+    sess.block_over = false
 
     // **Only a HEADERS frame is announced**: a PUSH_PROMISE also begins a block, but this binding
     // never delivers it as `Headers`, and the promise would break the rule that every
@@ -574,10 +624,26 @@ end on_begin_headers
 
 // **The bytes belong to nghttp2 and are gone when this returns**, so each field is copied into a
 // `string` here. That copy is why `Event.Headers` carries owned headers rather than views.
+//
+// **Past the limit a field is counted and dropped, and this still answers 0.** Failing the callback
+// would stop nghttp2 decoding the rest of the block, and the fields it skipped may have been added
+// to the HPACK table -- leaving this end's table different from the peer's, so that every later
+// block on the connection decodes wrong. Decoding to the end costs nghttp2 one field at a time and
+// costs this side nothing.
 private on_header(s: *c.Session, f: *c.Frame, name: *u8, namelen: usize, value: *u8,
     valuelen: usize, flags: u8, user: *u8) -> i32
 
     var sess = held(user)
+
+    if sess.block_over then return 0
+
+    sess.block_bytes += namelen + valuelen + 32
+
+    if sess.block_bytes > sess.max_header_list()
+        sess.block_over = true
+        sess.pending.clear()
+
+        return 0
 
     sess.pending.push(Header(from_utf8_unchecked(name[0..<namelen]),
         from_utf8_unchecked(value[0..<valuelen]), (flags & c.NV_FLAG_NO_INDEX) != 0))
@@ -637,12 +703,17 @@ private on_frame(s: *c.Session, f: *c.Frame, user: *u8) -> i32
     if ty == c.FRAME_HEADERS
         val h: *c.HeadersFrame = ptr_cast(f)
 
-        val block: Buf[Header] = buf()
+        if sess.block_over
+            sess.block_over = false
 
-        block.extend(sess.pending.view())
-        sess.pending.clear()
+            sess.events.push(HeaderListTooLarge(stream, kind_of(h.cat)))
+        else
+            val block: Buf[Header] = buf()
 
-        sess.events.push(Headers(stream, block, kind_of(h.cat)))
+            block.extend(sess.pending.view())
+            sess.pending.clear()
+
+            sess.events.push(Headers(stream, block, kind_of(h.cat)))
     else if ty == c.FRAME_RST_STREAM
         val r: *c.RstStreamFrame = ptr_cast(f)
 
@@ -737,10 +808,22 @@ end pull
 struct Options
     // Whether nghttp2 extends this end's flow-control windows as bytes arrive.
     auto_window_update: bool
+
+    // The header-list limit, where the caller named one.
+    private header_cap: Option[usize]
+
+    /** The same options, with the most a peer's header block may decode to set to `bytes`, in RFC
+     * 9113's measure (each field's name and value plus 32). **It overrides the default**, which is
+     * the `MaxHeaderListSize` this end advertises or 64 KiB; `Session.max_header_list` says more.
+     */
+    max_header_list(self, bytes: usize) -> Options = Options(self.auto_window_update, Some(bytes))
 end Options
 
-/** nghttp2's own defaults. */
-options() -> Options = Options(true)
+/** The header-list limit a session keeps when nothing else names one: 64 KiB. */
+val DefaultMaxHeaderList: usize = 65536
+
+/** nghttp2's own defaults, and the default header-list limit. */
+options() -> Options = Options(true, None)
 
 /** Take flow control over: this end sends its own WINDOW_UPDATEs, with `consume`.
  *
@@ -749,7 +832,7 @@ options() -> Options = Options(true)
  * that returns credit when the work is DONE makes the peer wait, which is what a proxy, an uploader
  * and anything writing to disk want.
  */
-no_auto_window_update() -> Options = Options(false)
+no_auto_window_update() -> Options = Options(false, None)
 
 private make(server: bool, o: Options) -> Result[&Session, Error]
     var cbs: *c.Callbacks = null
@@ -801,7 +884,8 @@ private make(server: bool, o: Options) -> Result[&Session, Error]
 
     if opened != 0 then return Err(failing(opened, "making a session"))
 
-    val box: &Session = Session(s, buf(), 0, buf(), buf(), o.auto_window_update)
+    val box: &Session = Session(s, buf(), 0, buf(), buf(), o.auto_window_update, o.header_cap, None,
+        0, false)
 
     // **The box's own address, which is what every callback above is handed.** A `&T` does not
     // move, so this stays true for as long as the session does -- and the session cannot outlive
@@ -826,10 +910,11 @@ server() -> Result[&Session, Error] = make(true, options())
 
 /** The same, said differently: a session made with something other than nghttp2's defaults.
  *
- * **There is one option here and it is here because `consume` cannot work without it.** nghttp2 has
- * a dozen; the rest are tuning a caller has not asked for, and a struct that grew a field per
- * setting would be a second copy of nghttp2's own documentation. Add the next one when something
- * needs it, which is how this one arrived.
+ * **There are two options here, each because something could not work without it**: `consume`
+ * needs the window left alone, and a server facing an HPACK bomb needs a header-list limit nghttp2
+ * does not keep. nghttp2 has a dozen; the rest are tuning a caller has not asked for, and a struct
+ * that grew a field per setting would be a second copy of nghttp2's own documentation. Add the next
+ * one when something needs it, which is how these arrived.
  */
 client_with(o: Options) -> Result[&Session, Error] = make(false, o)
 
