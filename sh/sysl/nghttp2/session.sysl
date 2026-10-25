@@ -28,6 +28,7 @@ module sh.sysl.nghttp2
 
 import sh.sysl.nghttp2.c
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
 import sysl.slices.{as_ptr, copy}
 import sysl.text.from_utf8_unchecked
 

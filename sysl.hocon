@@ -25,7 +25,7 @@ package {
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one — a floor is meant to be a fact rather than a guess.
-  sysl = "0.1.0-alpha.8"
+  sysl = "0.6.0"
 }
 
 // **`heap`, because every handle here is one nghttp2 allocated**: a session, a callbacks struct, an
