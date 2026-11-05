@@ -31,7 +31,7 @@ private transcript(headers: Buf[Header]) -> string
     for i in 0..<headers.len()
         if i > 0 then out += "|"
 
-        val h = headers.at(i)
+        val h = headers[i]
 
         out += s"${h.name}: ${h.value}"
 
@@ -157,8 +157,8 @@ sensitivity_survives_the_wire()
     val got = inf.inflate(block.view()).unwrap()
 
     assert_eq(got.len(), 2)
-    assert(got.at(0).sensitive)
-    assert(!got.at(1).sensitive)
+    assert(got[0].sensitive)
+    assert(!got[1].sensitive)
 end sensitivity_survives_the_wire
 
 // **An encoder with no table is legal and is the way to turn the side channel off entirely.**

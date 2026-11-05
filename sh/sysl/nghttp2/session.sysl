@@ -251,7 +251,7 @@ struct Session
 
             return None
 
-        val e = self.events.at(self.head)
+        val e = self.events[self.head]
 
         self.head += 1
 
@@ -362,7 +362,7 @@ struct Session
         var i: usize = 0
 
         while i < self.bodies.len()
-            var b = self.bodies.at(i)
+            var b = self.bodies[i]
 
             if b.stream == stream
                 if !b.open
@@ -381,7 +381,7 @@ struct Session
 
                 b.bytes.extend(bytes)
 
-                self.bodies.set(i, b)
+                self.bodies[i] = b
 
                 return self.wake(stream)
 
@@ -399,7 +399,7 @@ struct Session
         var i: usize = 0
 
         while i < self.bodies.len()
-            var b = self.bodies.at(i)
+            var b = self.bodies[i]
 
             if b.stream == stream
                 val tail: Buf[Header] = buf()
@@ -412,7 +412,7 @@ struct Session
                 b.has_trailers = tail.len() > 0
                 b.open = false
 
-                self.bodies.set(i, b)
+                self.bodies[i] = b
 
                 return self.wake(stream)
 
@@ -677,7 +677,7 @@ private on_stream_close(s: *c.Session, stream: i32, code: u32, user: *u8) -> i32
     var i: usize = 0
 
     while i < sess.bodies.len()
-        if sess.bodies.at(i).stream == stream
+        if sess.bodies[i].stream == stream
             sess.bodies.remove(i)
 
             break
@@ -757,7 +757,7 @@ private pull(s: *c.Session, stream: i32, out: *u8, length: usize, data_flags: *u
     var i: usize = 0
 
     while i < sess.bodies.len()
-        var b = sess.bodies.at(i)
+        var b = sess.bodies[i]
 
         if b.stream == stream
             val left = b.bytes.len() - b.sent
@@ -790,7 +790,7 @@ private pull(s: *c.Session, stream: i32, out: *u8, length: usize, data_flags: *u
 
                 sess.bodies.remove(i)
             else
-                sess.bodies.set(i, b)
+                sess.bodies[i] = b
 
             return isize(n)
 

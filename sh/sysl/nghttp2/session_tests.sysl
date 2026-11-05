@@ -89,7 +89,7 @@ private fields(hs: Buf[Header]) -> string
     for i in 0..<hs.len()
         if i > 0 then out += ","
 
-        val h = hs.at(i)
+        val h = hs[i]
 
         out += s"${h.name}=${h.value}"
 
