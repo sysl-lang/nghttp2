@@ -372,7 +372,7 @@ struct Session
                 // piece at a time may be a hundred thousand frames long, and a cursor that only
                 // ever moves forward would hold every byte of it for the life of the connection.
                 if b.sent > 0
-                    val left: Buf[u8] = buf()
+                    var left: Buf[u8] = buf()
 
                     left.extend(b.bytes.view()[b.sent..<b.bytes.len()])
 
@@ -402,7 +402,7 @@ struct Session
             var b = self.bodies[i]
 
             if b.stream == stream
-                val tail: Buf[Header] = buf()
+                var tail: Buf[Header] = buf()
 
                 trailers match
                     Some(ts) -> tail.extend(ts)
@@ -440,13 +440,13 @@ struct Session
     private hold(*self, stream: i32, body: Option[[]const u8], trailers: Option[[]const Header])
         if !sends_data(body, trailers) then return
 
-        val held: Buf[u8] = buf()
+        var held: Buf[u8] = buf()
 
         body match
             Some(bs) -> held.extend(bs)
             None -> ()
 
-        val tail: Buf[Header] = buf()
+        var tail: Buf[Header] = buf()
 
         trailers match
             Some(ts) -> tail.extend(ts)
@@ -459,7 +459,7 @@ struct Session
      * requires; this is for saying something in particular.
      */
     settings(*self, values: []const Setting) -> Result[unit, Error]
-        val iv: Buf[c.SettingsEntry] = buf()
+        var iv: Buf[c.SettingsEntry] = buf()
 
         for v in values
             iv.push(entry(v))
@@ -657,7 +657,7 @@ private on_data_chunk(s: *c.Session, flags: u8, stream: i32, data: *u8, len: usi
 
     var sess = held(user)
 
-    val chunk: Buf[u8] = buf()
+    var chunk: Buf[u8] = buf()
 
     chunk.extend(data[0..<len])
 
@@ -709,7 +709,7 @@ private on_frame(s: *c.Session, f: *c.Frame, user: *u8) -> i32
 
             sess.events.push(HeaderListTooLarge(stream, kind_of(h.cat)))
         else
-            val block: Buf[Header] = buf()
+            var block: Buf[Header] = buf()
 
             block.extend(sess.pending.view())
             sess.pending.clear()

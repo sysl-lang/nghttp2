@@ -46,7 +46,7 @@ end offers_h2
  * is refused.
  */
 alpn_list(protocols: []const string) -> Result[Buf[u8], Error]
-    val out: Buf[u8] = buf()
+    var out: Buf[u8] = buf()
 
     for name in protocols
         val bytes = name.bytes

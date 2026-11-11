@@ -72,7 +72,7 @@ private[nghttp2] to_nv(h: Header) -> c.Nv
 end to_nv
 
 private[nghttp2] to_nva(headers: []const Header) -> Buf[c.Nv]
-    val nva: Buf[c.Nv] = buf()
+    var nva: Buf[c.Nv] = buf()
 
     for h in headers
         nva.push(to_nv(h))
@@ -109,7 +109,7 @@ struct Deflater
 
         if n < 0 then return Err(failing(i32(n), "encoding a header block"))
 
-        val out: Buf[u8] = buf()
+        var out: Buf[u8] = buf()
 
         out.extend(scratch[0..<usize(n)])
 
@@ -166,7 +166,7 @@ struct Inflater
      * rather than views.
      */
     inflate(*self, block: []const u8, final: bool = true) -> Result[Buf[Header], Error]
-        val out: Buf[Header] = buf()
+        var out: Buf[Header] = buf()
 
         var nv = c.Nv(null, null, 0, 0, 0)
         var flags: i32 = 0
