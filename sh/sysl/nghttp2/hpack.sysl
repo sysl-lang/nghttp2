@@ -59,25 +59,40 @@ valid_value(value: string) -> bool
 end valid_value
 
 // **The `Nv` array is built over the caller's own strings and nghttp2 copies out of it.** Nothing
-// here owns bytes: `as_ptr` on a `string`'s bytes names them where they already are, and both
-// `hd_deflate_hd2` and `submit_*` are done with the array before they return. The one rule that
-// falls out is that the `Header`s must outlive the call, which they do -- they are the caller's
-// slice.
-private[nghttp2] to_nv(h: Header) -> c.Nv
-    val n = h.name.bytes
-    val v = h.value.bytes
+// here keeps bytes past the call: every name and value is copied once into `text`, which the
+// returned list owns, and the `Nv`s point into it. A short `string` holds its bytes inside the
+// `Header` rather than on the heap, so a pointer taken from the `Header` could not be lent out of
+// this function. `hd_deflate_hd2` and `submit_*` are done with the array before they return, so
+// the list only has to stay alive across that one call.
+private[nghttp2] struct NvList
+    nva: Buf[c.Nv]
+    text: Buf[u8]
 
-    c.Nv(as_ptr(n), as_ptr(v), n.len, v.len,
-        if h.sensitive then c.NV_FLAG_NO_INDEX else c.NV_FLAG_NONE)
-end to_nv
+    view(self) -> []const c.Nv = self.nva.view()
 
-private[nghttp2] to_nva(headers: []const Header) -> Buf[c.Nv]
+    len(self) -> usize = self.nva.len()
+end NvList
+
+private[nghttp2] to_nva(headers: []const Header) -> NvList
+    val text: Buf[u8] = buf()
+
+    for i in 0..<headers.len
+        text.extend(headers[i].name.bytes)
+        text.extend(headers[i].value.bytes)
+
     val nva: Buf[c.Nv] = buf()
+    var at: usize = 0
 
-    for h in headers
-        nva.push(to_nv(h))
+    for i in 0..<headers.len
+        val n = headers[i].name.bytes.len
+        val v = headers[i].value.bytes.len
 
-    nva
+        nva.push(c.Nv(as_ptr(text.view()[at..<at + n]), as_ptr(text.view()[at + n..<at + n + v]),
+            n, v, if headers[i].sensitive then c.NV_FLAG_NO_INDEX else c.NV_FLAG_NONE))
+
+        at += n + v
+
+    NvList(nva, text)
 end to_nva
 
 // -- the encoder ------------------------------------------------------------------------------

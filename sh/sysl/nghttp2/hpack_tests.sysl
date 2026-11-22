@@ -85,6 +85,24 @@ a_block_round_trips()
         ":status: 200|content-type: text/plain|content-length: 13|server: sysl")
 end a_block_round_trips
 
+// A name or value of 15 bytes or fewer is held inside the `Header` itself, so the encoder's
+// pointers cannot name the `Header`'s storage; names and values either side of that size, empty
+// values and a sensitive field all have to come back intact.
+@test("short and long names and values, empty values included, round trip through the encoder")
+short_and_long_fields_round_trip()
+    var def = deflater().unwrap()
+    var inf = inflater().unwrap()
+
+    val sent = [header("a", "b"), header("fifteen-bytes-xx", ""), header("x-fifteen-byte", "123456789012345"),
+        header("x-sixteen-bytes!", "1234567890123456"), sensitive("cookie", "k=v"),
+        header("x-empty", "")]
+
+    val got = inf.inflate(def.deflate(sent).unwrap().view()).unwrap()
+
+    assert_eq(transcript(got), "a: b|fifteen-bytes-xx: |x-fifteen-byte: 123456789012345|"
+        + "x-sixteen-bytes!: 1234567890123456|cookie: k=v|x-empty: ")
+end short_and_long_fields_round_trip
+
 // **This is the test that says the dynamic table is doing anything at all.** The second block is
 // the same fields as the first, so every one of them is already indexed and the encoding collapses
 // to one byte each. A binding that made a fresh encoder per block would pass every test above and
